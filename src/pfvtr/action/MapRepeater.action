@@ -1,0 +1,13 @@
+#goal definition
+float64 start_pos
+float64 end_pos
+uint8 traversals
+bool null_cmd
+uint8 image_pub
+bool use_dist
+string map_name
+---
+#result definition
+bool success
+---
+#feedback

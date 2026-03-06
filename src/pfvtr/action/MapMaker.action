@@ -1,0 +1,11 @@
+#goal definition
+bool save_imgs_for_viz
+string map_name
+bool start
+float32 map_step
+string source_map
+---
+#result definition
+bool success
+---
+#feedback
