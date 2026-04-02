@@ -67,13 +67,18 @@ def save_img(img_repr, image_msg: Image, header: Header, map_name: str,
     with open(filename + ".npy", "wb") as fp:
         np.save(fp, struct_save, fix_imports=False)
 
-    if save_img_flag:
-        if "rgb" in image_msg.encoding:
-            cv_img = bridge.imgmsg_to_cv2(image_msg, desired_encoding="rgb8")
-            cv2.imwrite(filename + ".jpg", cv2.cvtColor(cv_img, cv2.COLOR_RGB2BGR))
-        else:
-            cv_img = bridge.imgmsg_to_cv2(image_msg, desired_encoding="passthrough")
-            cv2.imwrite(filename + ".jpg", cv_img)
+    ok = False
+    if "rgb" in image_msg.encoding:
+        cv_img = bridge.imgmsg_to_cv2(image_msg, desired_encoding="rgb8")
+        ok = cv2.imwrite(filename + ".jpg", cv2.cvtColor(cv_img, cv2.COLOR_RGB2BGR))
+    else:
+        cv_img = bridge.imgmsg_to_cv2(image_msg, desired_encoding="passthrough")
+        ok = cv2.imwrite(filename + ".jpg", cv_img)
+
+    if not ok:
+        print(f"Failed to save image: {filename}.jpg")
+    else:
+        print(f"Saved image: {filename}.jpg")
 
 
 class MapmakerServer(Node):
@@ -105,11 +110,12 @@ class MapmakerServer(Node):
         self.source_map = None
 
         self.declare_parameter("cmd_vel_topic", "/bluetooth_teleop/cmd_vel")
-        self.declare_parameter("additional_record_topics", Parameter.Type.STRING_ARRAY)
-        self.declare_parameter("camera_topic", "/camera/image")
+        self.declare_parameter("odom_record_topic", "/odometry_publisher")
+        self.declare_parameter("camera_topic", "/camera_front_publisher")
 
         self.joy_topic = self.get_parameter("cmd_vel_topic").value
-        self.add_topic = self.get_parameter("additional_record_topics").value
+        self.cmd_vel_topic = self.get_parameter("cmd_vel_topic").value
+        self.odom_record_topic = self.get_parameter("odom_record_topic").value
         self.camera_topic = self.get_parameter("camera_topic").value
 
 
@@ -117,19 +123,19 @@ class MapmakerServer(Node):
 
         self.distance_reset_cli = self.create_client(SetDist, "teach/set_dist")
         self.align_reset_cli = self.create_client(SetDist, "teach/set_align")
-        while not self.distance_reset_cli.wait_for_service(timeout_sec=1.0):
+
+        while not self.distance_reset_cli.wait_for_service(timeout_sec=5.0):
             self.get_logger().info("Waiting for teach/set_dist...")
-        while not self.align_reset_cli.wait_for_service(timeout_sec=1.0):
+
+        self.get_logger().info("teach/set_dist is available")
+
+        while not self.align_reset_cli.wait_for_service(timeout_sec=5.0):
             self.get_logger().info("Waiting for teach/set_align...")
 
+        self.get_logger().info("teach/set_align is available")
 
-        req = SetDist.Request()
-        req.dist = 0.0
-        req.map_num = 1
-        self.distance_reset_cli.call(req)
-        self.align_reset_cli.call(req)
-        self._active_goal_handle = None
-
+        self.call_setdist_blocking(self.distance_reset_cli, "teach/set_dist", 0.0, 1)
+        self.call_setdist_blocking(self.align_reset_cli, "teach/set_align", 0.0, 1)
 
         self.local_align_cli = self.create_client(Alignment, "teach/local_alignment")
         if self.visual_turn:
@@ -141,10 +147,8 @@ class MapmakerServer(Node):
         self.get_logger().debug("Subscribing to commands")
         self.joy_sub = self.create_subscription(Twist, self.joy_topic, self.joy_cb, 100) #buff size!!!!!!!
 
-        self.get_logger().debug("Subscribing to odometry")
-        if len(self.add_topic) > 3:
-            self.add_sub = self.create_subscription(Odometry, self.add_topic, self.misc_cb, 10)
-
+        if self.odom_record_topic:
+            self.add_sub = self.create_subscription(Odometry, self.odom_record_topic, self.misc_cb, 10)
 
         self.get_logger().debug("Starting mapmaker action server")
         self._action_server = ActionServer(
@@ -156,7 +160,6 @@ class MapmakerServer(Node):
             cancel_callback=self.cancel_cb,
         )
 
-
         self.get_logger().warn("Mapmaker starting subscribers")
         self._setup_teach_sync()
 
@@ -166,6 +169,26 @@ class MapmakerServer(Node):
 
         self.get_logger().warn("Mapmaker started, awaiting goal")
 
+    def call_setdist_blocking(self, client, service_name: str, dist: float, map_num: int):
+        req = SetDist.Request()
+        req.dist = dist
+        req.map_num = map_num
+
+        self.get_logger().info(f"Calling {service_name}...")
+        future = client.call_async(req)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+
+        if not future.done():
+            self.get_logger().error(f"{service_name} did not complete in time")
+            return None
+
+        result = future.result()
+        if result is None:
+            self.get_logger().error(f"{service_name} failed")
+            return None
+
+        self.get_logger().info(f"Returned from {service_name}")
+        return result
 
     def _setup_teach_sync(self):
         repr_sub = Subscriber(self, FeaturesList, "live_representation")
@@ -203,7 +226,7 @@ class MapmakerServer(Node):
 
     def distance_img_cb(self, repr_msg: FeaturesList, dist_msg: SensorsOutput, img: Image):
         if self.img_features is None:
-            self.get_logger().warn("Mapmaker successfuly received images")
+            self.get_logger().warn("Mapmaker didn't receive the images successfully")
 
         feat0 = repr_msg.data[0]
         values = np.array(feat0.values).reshape(feat0.shape)
@@ -277,22 +300,26 @@ class MapmakerServer(Node):
                 self._bag_writer.write("/recorded_odometry", serialize_message(self.lastOdom), now_ns)
 
     def goal_cb(self, goal_request):
-        if self.isMapping:
+        if goal_request.start:
+            if self.isMapping:
+                return GoalResponse.REJECT
+            return GoalResponse.ACCEPT
+        else:
+            if self.isMapping:
+                return GoalResponse.ACCEPT
             return GoalResponse.REJECT
-        return GoalResponse.ACCEPT
 
     def cancel_cb(self, goal_handle):
         return CancelResponse.ACCEPT
 
     def _bag_open_for_map(self, map_name: str):
-        # rosbag2 directory (uri)
         bag_dir = os.path.join(map_name, "bag")
-        os.makedirs(bag_dir, exist_ok=True)
 
         storage_options = rosbag2_py.StorageOptions(
             uri=bag_dir,
-            storage_id="sqlite3"
+            storage_id="mcap"
         )
+
         converter_options = rosbag2_py.ConverterOptions(
             input_serialization_format="cdr",
             output_serialization_format="cdr"
@@ -303,11 +330,13 @@ class MapmakerServer(Node):
 
         # Register topics
         self._bag_writer.create_topic(rosbag2_py.TopicMetadata(
+            id=0,
             name="/recorded_actions",
             type="pfvtr/msg/DistancedTwist",
             serialization_format="cdr"
         ))
         self._bag_writer.create_topic(rosbag2_py.TopicMetadata(
+            id=0,
             name="/recorded_odometry",
             type="nav_msgs/msg/Odometry",
             serialization_format="cdr"
@@ -348,10 +377,7 @@ class MapmakerServer(Node):
             self.last_img_msg = None
 
 
-            req = SetDist.Request()
-            req.dist = 0.0
-            req.map_num = 1
-            self.distance_reset_cli.call(req)
+            self.call_setdist_blocking(self.distance_reset_cli, "teach/set_dist", 0.0, 1)
 
             self.mapStep = goal.map_step
             if self.mapStep <= 0.0:
@@ -362,11 +388,12 @@ class MapmakerServer(Node):
                 os.mkdir(goal.map_name)
                 with open(os.path.join(goal.map_name, "params"), "w") as f:
                     f.write(f"stepSize: {self.mapStep}\n")
-                    f.write(f"odomTopic: {self.joy_topic}\n")
-            except Exception:
-                self.get_logger().warn("Unable to create map directory, ignoring")
+                    f.write(f"cmdVelTopic: {self.cmd_vel_topic}\n")
+                    f.write(f"odomTopic: {self.odom_record_topic}\n")
+            except Exception as e:
+                self.get_logger().warn(f"Unable to create map directory, ignoring: {e}")
                 result.success = False
-                goal_handle.succeed()
+                goal_handle.abort()
                 return result
 
             self.get_logger().info("Starting mapping")
@@ -382,15 +409,19 @@ class MapmakerServer(Node):
         else:
             # stop mapping
             if self.target_distances is None:
-                save_img(
-                    self.img_features, self.img_msg, self.header, self.mapName,
-                    float(self.dist), self.curr_hist, self.curr_alignment,
-                    self.source_map, self.save_imgs, self.bridge
-                )
-                self.get_logger().info(f"Creating final wp at dist: {self.dist}")
+                if self.header is not None and self.img_msg is not None and self.img_features is not None:
+                    save_img(
+                        self.img_features, self.img_msg, self.header, self.mapName,
+                        float(self.dist), self.curr_hist, self.curr_alignment,
+                        self.source_map, self.save_imgs, self.bridge
+                    )
+                    self.get_logger().info(f"Creating final wp at dist: {self.dist}")
+                else:
+                    self.get_logger().warn(
+                        "Skipping final waypoint save: no synchronized image/features/header received yet")
 
             self.get_logger().warn("Stopping Mapping")
-            self.get_logger().info(f"Map saved under: '{os.path.join(os.path.expanduser('~'), '.ros', self.mapName)}'")
+            self.get_logger().info(f"Map saved under: '{os.path.abspath(self.mapName)}'")
 
             time.sleep(2)
             self.isMapping = False
