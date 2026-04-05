@@ -62,7 +62,6 @@ install(PROGRAMS
 
 install(DIRECTORY
   launch
-  config
   DESTINATION share/${PROJECT_NAME}
 )
 

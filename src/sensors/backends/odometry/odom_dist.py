@@ -3,7 +3,7 @@ from base_classes import RelativeDistanceEstimator, AbsoluteDistanceEstimator
 from nav_msgs.msg import Odometry
 from rclpy.logging import get_logger
 
-import tf_transformations
+# import tf_transformations
 
 
 def pose_to_angle(pose_msg):
@@ -40,9 +40,9 @@ class OdometryAbsolute(AbsoluteDistanceEstimator):
         self._distance += (dx ** 2 + dy ** 2 + dz ** 2) ** 0.5
 
         # add very slight distance during turning to avoid similar images
-        yaw1 = pose_to_angle(self.last_odom.pose)
-        yaw2 = pose_to_angle(msg.pose)
-        dturn = min((2 * 3.16) - abs(yaw1 - yaw2), abs(yaw1 - yaw2))
+        # yaw1 = pose_to_angle(self.last_odom.pose)
+        # yaw2 = pose_to_angle(msg.pose)
+        # dturn = min((2 * 3.16) - abs(yaw1 - yaw2), abs(yaw1 - yaw2))
         # self._distance += abs(dturn)
 
         self.last_odom = msg
@@ -78,9 +78,9 @@ class OdometryRelative(RelativeDistanceEstimator):
         dz = self.last_odom.pose.pose.position.z - msg.pose.pose.position.z
 
         # add very slight distance during turning to avoid similar images
-        yaw1 = pose_to_angle(self.last_odom.pose)
-        yaw2 = pose_to_angle(msg.pose)
-        dturn = min((2 * 3.16) - abs(yaw1 - yaw2), abs(yaw1 - yaw2))
+        # yaw1 = pose_to_angle(self.last_odom.pose)
+        # yaw2 = pose_to_angle(msg.pose)
+        # dturn = min((2 * 3.16) - abs(yaw1 - yaw2), abs(yaw1 - yaw2))
         self.last_odom = msg
         ret = (dx ** 2 + dy ** 2 + dz ** 2) ** 0.5
         if ret > 7.0:  # for rosbag switching
