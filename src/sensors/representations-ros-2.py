@@ -91,7 +91,9 @@ class RepresentationMatching(Node):
 
     def image_parserCB(self, image: Image):
         img_msg, _ = self.parse_camera_msg(image)
-        msg = ImageList([img_msg])
+        msg = ImageList()
+        msg.data = [img_msg]
+        # msg = ImageList([img_msg])
         live_feature = self.align_abs._to_feature(msg)
         tmp_sns_in = copy(self.sns_in_msg)
 

@@ -8,31 +8,31 @@ def generate_launch_description():
 
     camera_topic = DeclareLaunchArgument(
         "camera_topic",
-        default_value="/robot1/camera1/image",
+        default_value="/camera_front_publisher",
         description="Camera topic name",
     )
 
     cmd_vel_pub = DeclareLaunchArgument(
         "cmd_vel_pub",
-        default_value="/bluetooth_teleop/cmd_vel",
+        default_value="/cmd_vel_publisher",
         description="Topic to publish cmd_vel when replaying a map",
     )
 
     cmd_vel_sub = DeclareLaunchArgument(
         "cmd_vel_sub",
-        default_value="/bluetooth_teleop/cmd_vel",
+        default_value="/cmd_vel_subscriber",
         description="Topic to record cmd_vel when making a map",
     )
 
     odom_topic = DeclareLaunchArgument(
         "odom_topic",
-        default_value="/robot1/odometry",
+        default_value="/odometry_publisher",
         description="Topic for odometry input",
     )
 
     additional_record_topics = DeclareLaunchArgument(
         "additional_record_topics",
-        default_value="[/robot1/odometry]",
+        default_value="[/odometry_publisher]",
         description="List of additional topics to record & replay",
     )
 
