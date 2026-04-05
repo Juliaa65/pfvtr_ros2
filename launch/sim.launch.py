@@ -14,13 +14,13 @@ def generate_launch_description():
 
     cmd_vel_pub = DeclareLaunchArgument(
         "cmd_vel_pub",
-        default_value="/cmd_vel_publisher",
+        default_value="/action_subscriber",
         description="Topic to publish cmd_vel when replaying a map",
     )
 
     cmd_vel_sub = DeclareLaunchArgument(
         "cmd_vel_sub",
-        default_value="/cmd_vel_subscriber",
+        default_value="/action_subscriber",
         description="Topic to record cmd_vel when making a map",
     )
 
@@ -30,10 +30,10 @@ def generate_launch_description():
         description="Topic for odometry input",
     )
 
-    additional_record_topics = DeclareLaunchArgument(
-        "additional_record_topics",
-        default_value="[/odometry_publisher]",
-        description="List of additional topics to record & replay",
+    odom_record_topic = DeclareLaunchArgument(
+        "odom_record_topic",
+        default_value="/odometry_publisher",
+        description="Topic for odometry recording in mapmaker",
     )
 
     particle_num = DeclareLaunchArgument("particle_num", default_value="600")
@@ -90,6 +90,17 @@ def generate_launch_description():
 
             Node(
                 package="pfvtr",
+                executable="controller-ros-2.py",
+                name="controller",
+                output="screen",
+                respawn=True,
+                parameters=[{
+                    "cmd_vel_topic": lc("cmd_vel_pub"),
+                }],
+            ),
+
+            Node(
+                package="pfvtr",
                 executable="mapmaker-ros-2.py",
                 name="mapmaker",
                 output="screen",
@@ -97,8 +108,8 @@ def generate_launch_description():
                 parameters=[{
                     "camera_topic": lc("camera_topic"),
                     "cmd_vel_topic": lc("cmd_vel_sub"),
-                    "additional_record_topics": lc("additional_record_topics"),
-                }],
+                    "odom_record_topic": lc("odom_record_topic"),
+                }]
             ),
 
             Node(
@@ -111,17 +122,6 @@ def generate_launch_description():
                     "camera_topic": lc("camera_topic"),
                 }],
             ),
-
-            Node(
-                package="pfvtr",
-                executable="controller-ros-2.py",
-                name="controller",
-                output="screen",
-                respawn=True,
-                parameters=[{
-                    "cmd_vel_topic": lc("cmd_vel_pub"),
-                }],
-            ),
         ]
     )
 
@@ -130,7 +130,7 @@ def generate_launch_description():
         cmd_vel_pub,
         cmd_vel_sub,
         odom_topic,
-        additional_record_topics,
+        odom_record_topic,
         particle_num,
         odom_error,
         dist_init_std,

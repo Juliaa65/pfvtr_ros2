@@ -27,7 +27,7 @@ RESIZE_W = 512
 
 class RepresentationMatching(Node):
     def __init__(self):
-        super().__init__("sensor_processing")
+        super().__init__("representation_matching")
         self.get_logger().info("Sensor processing started!")
 
         self.declare_parameter("camera_topic", "/robot1/camera1/image")
@@ -79,7 +79,6 @@ class RepresentationMatching(Node):
 
 
     def parse_camera_msg(self, msg: Image):
-
         img = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
         if "bgr" in msg.encoding:
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -93,7 +92,6 @@ class RepresentationMatching(Node):
         img_msg, _ = self.parse_camera_msg(image)
         msg = ImageList()
         msg.data = [img_msg]
-        # msg = ImageList([img_msg])
         live_feature = self.align_abs._to_feature(msg)
         tmp_sns_in = copy(self.sns_in_msg)
 
