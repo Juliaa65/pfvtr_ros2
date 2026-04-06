@@ -14,13 +14,13 @@ def generate_launch_description():
 
     cmd_vel_pub = DeclareLaunchArgument(
         "cmd_vel_pub",
-        default_value="/action_subscriber",
+        default_value="/cmd_vel_publisher",
         description="Topic to publish cmd_vel when replaying a map",
     )
 
     cmd_vel_sub = DeclareLaunchArgument(
         "cmd_vel_sub",
-        default_value="/action_subscriber",
+        default_value="/cmd_vel_subscriber",
         description="Topic to record cmd_vel when making a map",
     )
 
