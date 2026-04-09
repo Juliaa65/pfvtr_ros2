@@ -77,14 +77,40 @@ class RepresentationMatching(Node):
             callback_group=self.cb_group
         )
 
-
     def parse_camera_msg(self, msg: Image):
-        img = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
+        try:
+            img = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
+        except Exception as e:
+            self.get_logger().warn(f"cv_bridge conversion failed: {e}")
+            return None, None
+
+        if img is None:
+            self.get_logger().warn("Received empty image from cv_bridge")
+            return None, None
+
+        if hasattr(img, "size") and img.size == 0:
+            self.get_logger().warn("Received zero-sized image")
+            return None, None
+
         if "bgr" in msg.encoding:
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        if "rgba" in msg.encoding:
-            img = img[..., :3]
-        img_msg = self.bridge.cv2_to_imgmsg(img, encoding="rgb8")
+        elif "rgba" in msg.encoding:
+            if img.ndim == 3 and img.shape[2] >= 3:
+                img = img[..., :3]
+            else:
+                self.get_logger().warn(f"Unexpected rgba image shape: {getattr(img, 'shape', None)}")
+                return None, None
+        elif "rgb" in msg.encoding:
+            pass
+        else:
+            self.get_logger().warn(f"Unexpected image encoding: {msg.encoding}")
+
+        try:
+            img_msg = self.bridge.cv2_to_imgmsg(img, encoding="rgb8")
+        except Exception as e:
+            self.get_logger().warn(f"cv2_to_imgmsg failed: {e}")
+            return None, None
+
         img_msg.header = msg.header
         return img_msg, img
 

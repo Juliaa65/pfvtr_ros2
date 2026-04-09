@@ -108,6 +108,8 @@ class MapmakerServer(Node):
         self.lastOdom = None
         self.curr_alignment = None
         self.source_map = None
+        self.align_future = None
+        self.align_in_progress = False
 
         self.declare_parameter("cmd_vel_topic", "/bluetooth_teleop/cmd_vel")
         self.declare_parameter("odom_record_topic", "/odometry_publisher")
@@ -134,8 +136,15 @@ class MapmakerServer(Node):
 
         self.get_logger().info("teach/set_align is available")
 
-        self.call_setdist_blocking(self.distance_reset_cli, "teach/set_dist", 0.0, 1)
-        self.call_setdist_blocking(self.align_reset_cli, "teach/set_align", 0.0, 1)
+        req = SetDist.Request()
+        req.dist = 0.0
+        req.map_num = 1
+        self.call_service_blocking(self.distance_reset_cli, "teach/set_dist", req)
+
+        req = SetDist.Request()
+        req.dist = 0.0
+        req.map_num = 1
+        self.call_service_blocking(self.align_reset_cli, "teach/set_align", req)
 
         self.local_align_cli = self.create_client(Alignment, "teach/local_alignment")
         if self.visual_turn:
@@ -169,14 +178,10 @@ class MapmakerServer(Node):
 
         self.get_logger().warn("Mapmaker started, awaiting goal")
 
-    def call_setdist_blocking(self, client, service_name: str, dist: float, map_num: int):
-        req = SetDist.Request()
-        req.dist = dist
-        req.map_num = map_num
-
+    def call_service_blocking(self, client, service_name: str, req, timeout_sec: float = 5.0):
         self.get_logger().info(f"Calling {service_name}...")
         future = client.call_async(req)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=timeout_sec)
 
         if not future.done():
             self.get_logger().error(f"{service_name} did not complete in time")
@@ -189,6 +194,38 @@ class MapmakerServer(Node):
 
         self.get_logger().info(f"Returned from {service_name}")
         return result
+
+    def handle_alignment_async(self, srv_msg):
+        if self.align_future is not None and self.align_future.done():
+            try:
+                resp = self.align_future.result()
+
+                if resp is None or len(resp.histograms) == 0:
+                    self.curr_hist = None
+                    self.curr_trans = 0.0
+                else:
+                    hist = resp.histograms[0].data
+                    half_size = np.size(hist) / 2.0
+                    self.curr_hist = hist
+                    self.curr_trans = -float(np.argmax(hist) - (np.size(hist) // 2.0)) / half_size
+
+                #self.get_logger().warn("local_alignment response received")
+
+            except Exception as e:
+                self.get_logger().warn(f"Alignment future failed: {e}")
+                self.curr_hist = None
+                self.curr_trans = 0.0
+
+            self.align_future = None
+            self.align_in_progress = False
+
+        if not self.align_in_progress:
+            req = Alignment.Request()
+            req.input = srv_msg
+
+            #self.get_logger().warn("Sending local_alignment request")
+            self.align_future = self.local_align_cli.call_async(req)
+            self.align_in_progress = True
 
     def _setup_teach_sync(self):
         repr_sub = Subscriber(self, FeaturesList, "live_representation")
@@ -228,6 +265,9 @@ class MapmakerServer(Node):
         if self.img_features is None:
             self.get_logger().warn("Mapmaker didn't receive the images successfully")
 
+        dist = float(dist_msg.output)
+        #self.get_logger().warn(f"SYNC CB fired | isMapping={self.isMapping} | dist={dist}")
+
         feat0 = repr_msg.data[0]
         values = np.array(feat0.values).reshape(feat0.shape)
         self.img_features = [values, feat0.descriptors]
@@ -244,16 +284,8 @@ class MapmakerServer(Node):
             srv_msg = SensorsInput()
             srv_msg.map_features = [numpy_to_feature(self.last_img_features)]
             srv_msg.live_features = [numpy_to_feature(self.img_features)]
-            try:
-                req = Alignment.Request()
-                req.input = srv_msg
-                resp = self.local_align_cli.call(req)
-                hist = resp.histograms[0].data
-                half_size = np.size(hist) / 2.0
-                self.curr_hist = hist
-                self.curr_trans = -float(np.argmax(hist) - (np.size(hist) // 2.0)) / half_size
-            except Exception as e:
-                self.get_logger().warn(f"Service call failed: {e}")
+
+            self.handle_alignment_async(srv_msg)
         else:
             self.curr_trans = 0.0
             self.curr_hist = None
@@ -376,8 +408,10 @@ class MapmakerServer(Node):
             self.img_msg = None
             self.last_img_msg = None
 
-
-            self.call_setdist_blocking(self.distance_reset_cli, "teach/set_dist", 0.0, 1)
+            req = SetDist.Request()
+            req.dist = 0.0
+            req.map_num = 1
+            self.call_service_blocking(self.distance_reset_cli, "teach/set_dist", req)
 
             self.mapStep = goal.map_step
             if self.mapStep <= 0.0:
@@ -420,6 +454,9 @@ class MapmakerServer(Node):
                     self.get_logger().warn(
                         "Skipping final waypoint save: no synchronized image/features/header received yet")
 
+            self.get_logger().warn(
+                f"STOP STATE | header={self.header is not None} | img={self.img_msg is not None} | feat={self.img_features is not None} | dist={self.dist}"
+            )
             self.get_logger().warn("Stopping Mapping")
             self.get_logger().info(f"Map saved under: '{os.path.abspath(self.mapName)}'")
 

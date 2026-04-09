@@ -4,6 +4,7 @@ import numpy as np
 
 from rclpy.node import Node
 
+from pfvtr.msg import FloatList
 from pfvtr.msg import SensorsOutput, ImageList, Features
 from pfvtr.srv import SetDist, Representations
 
@@ -302,7 +303,14 @@ class SensorFusion(ABC):
         return self.repr_creator.to_feature(msg)
 
     def process_rel_alignment(self, request, response):
-        return self._process_rel_alignment(request, response)
+        result = self._process_rel_alignment(request)
+        if result is not None:
+            response.histograms = []
+            for hist in result.histograms:
+                msg = FloatList()
+                msg.data = [float(x) for x in hist]
+                response.histograms.append(msg)
+        return response
 
     def process_abs_alignment(self, msg):
         if self.alignment is not None:

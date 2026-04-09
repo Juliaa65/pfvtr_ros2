@@ -5,6 +5,7 @@ from rclpy.qos import QoSProfile, qos_profile_sensor_data
 
 from pfvtr.srv import Alignment
 from sensor_processing import BearnavClassic, PF2D, VisualOnly, NNPolicy
+from rclpy.executors import MultiThreadedExecutor
 
 from backends.odometry.odom_dist import OdometryAbsolute, OdometryRelative
 from backends.siamese.siamese import SiameseCNN
@@ -152,8 +153,10 @@ class SensorProcessingNode(Node):
 def main():
     rclpy.init()
     node = SensorProcessingNode()
+    executor = MultiThreadedExecutor(num_threads=4)
     try:
-        rclpy.spin(node)
+        executor.add_node(node)
+        executor.spin()
     finally:
         node.destroy_node()
         rclpy.shutdown()
