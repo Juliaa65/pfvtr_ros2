@@ -107,7 +107,7 @@ def generate_launch_description():
                 respawn=True,
                 parameters=[{
                     "camera_topic": lc("camera_topic"),
-                    "cmd_vel_topic": lc("cmd_vel_sub"),
+                    "cmd_vel_topic": lc("cmd_vel_pub"),
                     "odom_record_topic": lc("odom_record_topic"),
                 }]
             ),
