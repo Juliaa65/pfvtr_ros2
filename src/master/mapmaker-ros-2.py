@@ -14,7 +14,7 @@ from rclpy.serialization import serialize_message
 from rclpy.parameter import Parameter
 
 from sensor_msgs.msg import Image
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, TwistStamped
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Header
 
@@ -154,7 +154,7 @@ class MapmakerServer(Node):
 
 
         self.get_logger().debug("Subscribing to commands")
-        self.joy_sub = self.create_subscription(Twist, self.joy_topic, self.joy_cb, 100) #buff size!!!!!!!
+        self.joy_sub = self.create_subscription(TwistStamped, self.joy_topic, self.joy_cb, 100) #buff size!!!!!!!
 
         if self.odom_record_topic:
             self.add_sub = self.create_subscription(Odometry, self.odom_record_topic, self.misc_cb, 10)
@@ -317,12 +317,12 @@ class MapmakerServer(Node):
 
         self.checkShutdown()
 
-    def joy_cb(self, msg: Twist):
+    def joy_cb(self, msg: TwistStamped):
         if self.isMapping:
             if self._bag_writer is None:
                 return
             save_msg = DistancedTwist()
-            save_msg.twist = msg
+            save_msg.twist = msg.twist
             save_msg.distance = float(self.dist)
 
             now_ns = self.get_clock().now().nanoseconds
