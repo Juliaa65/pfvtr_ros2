@@ -301,8 +301,8 @@ class SensorFusion(ABC):
     def create_representations(self, msg):
         return self.repr_creator.to_feature(msg)
 
-    def process_rel_alignment(self, msg):
-        return self._process_rel_alignment(msg)
+    def process_rel_alignment(self, request, response):
+        return self._process_rel_alignment(request, response)
 
     def process_abs_alignment(self, msg):
         if self.alignment is not None:
@@ -321,7 +321,7 @@ class SensorFusion(ABC):
             self._process_prob_distance(msg)
 
     @abstractmethod
-    def _process_rel_alignment(self, msg):
+    def _process_rel_alignment(self, request, response):
         raise NotImplementedError
 
     @abstractmethod

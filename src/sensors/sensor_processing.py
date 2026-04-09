@@ -55,11 +55,15 @@ class BearnavClassic(SensorFusion):
         )
         self._log = node.get_logger()
 
-    def _process_rel_alignment(self, request: Alignment.Request):
+    def _process_rel_alignment(self, request: Alignment.Request, response: Alignment.Response):
         histogram = self.rel_align_est.displacement_message_callback(request.input)
-        out = Alignment.Response()
-        out.histograms = histogram
-        return out
+        float_lists = []
+        for h in histogram:
+            fl = FloatList()
+            fl.data = list(h)
+            float_lists.append(fl)
+        response.histograms = float_lists
+        return response
 
     def _process_abs_alignment(self, msg):
         # if msg.map_features[0].shape[0] > 1:
@@ -227,11 +231,15 @@ class PF2D(SensorFusion):
         )
         return response
 
-    def _process_rel_alignment(self, request: Alignment.Request):
+    def _process_rel_alignment(self, request: Alignment.Request, response: Alignment.Response):
         histogram = self.rel_align_est.displacement_message_callback(request.input)
-        out = Alignment.Response()
-        out.histograms = histogram
-        return out
+        float_lists = []
+        for h in histogram:
+            fl = FloatList()
+            fl.data = list(h)
+            float_lists.append(fl)
+        response.histograms = float_lists
+        return response
 
     def _create_trans_matrix(self, array, map_num):
         transitions = np.zeros((map_num, map_num))
@@ -597,11 +605,15 @@ class NNPolicy(SensorFusion):
         self.input_size = 5
         self.dist_span = 8
 
-    def _process_rel_alignment(self, request: Alignment.Request):
+    def _process_rel_alignment(self, request: Alignment.Request, response: Alignment.Response):
         histogram = self.rel_align_est.displacement_message_callback(request.input)
-        out = Alignment.Response()
-        out.histograms = histogram
-        return out
+        float_lists = []
+        for h in histogram:
+            fl = FloatList()
+            fl.data = list(h)
+            float_lists.append(fl)
+        response.histograms = float_lists
+        return response
 
     def _process_abs_alignment(self, msg):
         curr_time = _builtin_stamp_to_rclpy_time(msg.header.stamp, self._clock)
