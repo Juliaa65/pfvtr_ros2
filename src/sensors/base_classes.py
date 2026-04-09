@@ -276,6 +276,7 @@ class SensorFusion(ABC):
         else:
             out.output = 0.0
             out.output_uncertainty = -1.0
+        out.map = self.map
         self.output_align.publish(out)
 
 

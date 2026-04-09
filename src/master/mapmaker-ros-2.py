@@ -50,7 +50,7 @@ def save_img(img_repr, image_msg: Image, header: Header, map_name: str,
              curr_dist, curr_hist, curr_align, source_map, save_img_flag: bool,
              bridge: CvBridge):
     filename = str(map_name) + "/" + str(curr_dist)
-    ts = (header.stamp.sec, header.stamp.nanosec)
+    ts = header.stamp.sec + header.stamp.nanosec / 1e9
 
 
     struct_save = {

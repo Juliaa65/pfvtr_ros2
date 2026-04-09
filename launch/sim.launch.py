@@ -12,16 +12,16 @@ def generate_launch_description():
         description="Camera topic name",
     )
 
-    cmd_vel_pub = DeclareLaunchArgument(
-        "cmd_vel_pub",
+    cmd_vel_teleop_output = DeclareLaunchArgument(
+        "cmd_vel_teleop_output",
         default_value="/cmd_vel_publisher",
-        description="Topic to publish cmd_vel when replaying a map",
+        description="Topic where simulator publishes teleop commands (for recording)",
     )
 
-    cmd_vel_sub = DeclareLaunchArgument(
-        "cmd_vel_sub",
+    cmd_vel_robot_input = DeclareLaunchArgument(
+        "cmd_vel_robot_input",
         default_value="/cmd_vel_subscriber",
-        description="Topic to record cmd_vel when making a map",
+        description="Topic to send velocity commands to control the robot",
     )
 
     odom_topic = DeclareLaunchArgument(
@@ -95,7 +95,7 @@ def generate_launch_description():
                 output="screen",
                 respawn=True,
                 parameters=[{
-                    "cmd_vel_topic": lc("cmd_vel_pub"),
+                    "cmd_vel_topic": lc("cmd_vel_robot_input"),
                 }],
             ),
 
@@ -107,7 +107,7 @@ def generate_launch_description():
                 respawn=True,
                 parameters=[{
                     "camera_topic": lc("camera_topic"),
-                    "cmd_vel_topic": lc("cmd_vel_pub"),
+                    "cmd_vel_topic": lc("cmd_vel_teleop_output"),
                     "odom_record_topic": lc("odom_record_topic"),
                 }]
             ),
@@ -127,8 +127,8 @@ def generate_launch_description():
 
     return LaunchDescription([
         camera_topic,
-        cmd_vel_pub,
-        cmd_vel_sub,
+        cmd_vel_teleop_output,
+        cmd_vel_robot_input,
         odom_topic,
         odom_record_topic,
         particle_num,

@@ -488,7 +488,7 @@ class PF2D(SensorFusion):
                     maps.append(np.sum(self.particle_prob[self.particles[2] == i]))
                 ind = np.argmax(maps)
                 # rospy.logwarn(maps)
-                self.map = ind
+                self.map = int(ind)
         else:
             self.coords = [0.0, 0.0]
 

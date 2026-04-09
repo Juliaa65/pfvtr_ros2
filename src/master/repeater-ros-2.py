@@ -8,6 +8,7 @@ import cv2
 
 import rclpy
 from rclpy.node import Node
+from rclpy.time import Time
 from rclpy.action import ActionServer, GoalResponse, CancelResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -239,7 +240,11 @@ class RepeaterServer(Node):
                 )
             ]
 
-            sns_in.map_timestamps = timestamps
+            # Convert float timestamps to builtin_interfaces/Time messages
+            time_msgs = []
+            for ts in timestamps:
+                time_msgs.append(Time(seconds=ts).to_msg())
+            sns_in.map_timestamps = time_msgs
             sns_in.map_num = self.map_num
             # TODO: sns_in.map_similarity
             sns_in.map_offset = offsets
@@ -325,7 +330,7 @@ class RepeaterServer(Node):
 
     def _open_bag2_reader(self, bag_uri: str) -> rosbag2_py.SequentialReader:
         reader = rosbag2_py.SequentialReader()
-        storage_options = rosbag2_py.StorageOptions(uri=bag_uri, storage_id="sqlite3")
+        storage_options = rosbag2_py.StorageOptions(uri=bag_uri, storage_id="mcap")
         converter_options = rosbag2_py.ConverterOptions(
             input_serialization_format="cdr",
             output_serialization_format="cdr"
@@ -361,8 +366,13 @@ class RepeaterServer(Node):
             self.action_dists.append(float(msg.distance))
             self.actions.append(msg.twist)
 
-        self.action_dists = np.array(self.action_dists)
-        self.get_logger().warn("Actions and distances successfully loaded!")
+        # Convert to numpy array immediately after parsing
+        if len(self.action_dists) > 0:
+            self.action_dists = np.array(self.action_dists)
+            self.get_logger().warn(f"Actions and distances successfully loaded! ({len(self.actions)} actions)")
+        else:
+            self.get_logger().warn("WARNING: No action commands found in rosbag!")
+            self.action_dists = None
 
     def play_closest_action(self):
         if self.action_dists is not None and len(self.action_dists) > 0 and self.isRepeating:
@@ -373,7 +383,7 @@ class RepeaterServer(Node):
             self.get_logger().warn("No action available - stopping")
             req = SetDist.Request()
             req.dist = 0.0
-            req.mode = 1
+            req.map_num = 1
             self.align_reset_cli.call(req)
             self.joy_pub.publish(Twist())
 
@@ -452,7 +462,7 @@ class RepeaterServer(Node):
 
         req = SetDist.Request()
         req.dist = 0.0
-        req.mode = 1
+        req.map_num = 1
         self.align_reset_cli.call(req)
 
         self.endPosition = goal.end_pos
@@ -489,17 +499,19 @@ class RepeaterServer(Node):
 
         req = SetDist.Request()
         req.dist = float(goal.start_pos)
-        req.mode = int(self.map_num)
+        req.map_num = int(self.map_num)
         self.distance_reset_cli.call(req)
 
         self.curr_dist = float(goal.start_pos)
         time.sleep(2)
 
+        if self.use_distances:
+            self.parse_rosbag(bag_uri)
+
         self.get_logger().info("Repeating started!")
         self.isRepeating = True
 
         if self.use_distances:
-            self.parse_rosbag(bag_uri)
             self.play_closest_action()
         else:
             self.replay_timewise(bag_uri)

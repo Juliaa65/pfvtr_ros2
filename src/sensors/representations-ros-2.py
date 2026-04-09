@@ -143,11 +143,13 @@ class RepresentationMatching(Node):
         live_hist = np.array(out[-1])  # all live map distances vs live img
         map_hist = np.array(out[:-1])
 
-
         align_out.header = image.header
         align_out.live_histograms = [
-            Histogram(live_hist.flatten(), live_hist.shape)]
-        align_out.map_histograms = [Histogram(map_hist.flatten(), map_hist.shape)]
+            Histogram(values=list(live_hist.flatten()), shape=list(live_hist.shape))
+        ]
+        align_out.map_histograms = [
+            Histogram(values=list(map_hist.flatten()), shape=list(map_hist.shape))
+        ]
         align_out.map_distances = tmp_sns_in.map_distances
         align_out.map_transitions = tmp_sns_in.map_transitions
         align_out.map_timestamps = tmp_sns_in.map_timestamps
