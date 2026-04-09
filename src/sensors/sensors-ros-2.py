@@ -74,36 +74,49 @@ class SensorProcessingNode(Node):
         )
 
         # 1) Bearnav classic - this method also needs publish span 0 in the repeater !!!
-        # repeat_fusion = BearnavClassic("repeat", align_abs, dist_abs, align_abs, None)
-        # repeat_handlers = start_subscribes(repeat_fusion,
-        #                                    "matched_repr", odom_topic, "", "",
-        #                                    "", "")
-        # 2) Particle filter 2D - parameters are really important
-        self.repeat_fusion = PF2D(
+        self.repeat_fusion = BearnavClassic(
             node=self,
             type_prefix="repeat",
-            particles_num=particle_num,
-            odom_error=odom_error,
-            odom_init_std=dist_init_std,
-            align_beta=align_beta,
-            align_init_std=align_init_std,
-            particles_frac=1,
-            choice_beta=choice_beta,
-            add_random=add_random,
-            debug=True,
             abs_align_est=align_abs,
-            rel_align_est=align_rel,
-            rel_dist_est=dist_rel,
+            abs_dist_est=dist_abs,
+            rel_align_est=align_abs,
             repr_creator=align_abs
         )
         self._start_subscribes(
             fusion=self.repeat_fusion,
             abs_align_topic="matched_repr",
-            abs_dist_topic="",
-            rel_dist_topic=odom_topic,
+            abs_dist_topic=odom_topic,
+            rel_dist_topic="",
             prob_dist_topic="",
             rel_align_service_name="local_alignment"
         )
+        
+        # 2) Particle filter 2D - parameters are really important
+        # self.repeat_fusion = PF2D(
+        #     node=self,
+        #     type_prefix="repeat",
+        #     particles_num=particle_num,
+        #     odom_error=odom_error,
+        #     odom_init_std=dist_init_std,
+        #     align_beta=align_beta,
+        #     align_init_std=align_init_std,
+        #     particles_frac=1,
+        #     choice_beta=choice_beta,
+        #     add_random=add_random,
+        #     debug=True,
+        #     abs_align_est=align_abs,
+        #     rel_align_est=align_rel,
+        #     rel_dist_est=dist_rel,
+        #     repr_creator=align_abs
+        # )
+        # self._start_subscribes(
+        #     fusion=self.repeat_fusion,
+        #     abs_align_topic="matched_repr",
+        #     abs_dist_topic="",
+        #     rel_dist_topic=odom_topic,
+        #     prob_dist_topic="",
+        #     rel_align_service_name="local_alignment"
+        # )
 
     def _start_subscribes(self, fusion,
                          abs_align_topic, abs_dist_topic, rel_dist_topic, prob_dist_topic,
