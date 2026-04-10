@@ -55,6 +55,7 @@ install(PROGRAMS
   src/controller/controller-ros-2.py
   src/master/repeater-ros-2.py
   src/master/mapmaker-ros-2.py
+  src/master/vtr_gui.py
   src/sensors/sensors-ros-2.py
   src/sensors/representations-ros-2.py
   DESTINATION lib/${PROJECT_NAME}
