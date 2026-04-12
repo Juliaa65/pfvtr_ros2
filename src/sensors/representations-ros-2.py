@@ -6,7 +6,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
-from rclpy.qos import qos_profile_sensor_data, QoSProfile
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
@@ -53,20 +53,18 @@ class RepresentationMatching(Node):
         self.sns_in_msg = None
 
         self.bridge = CvBridge()
-        self.cb_group = ReentrantCallbackGroup()
 
-        img_qos = qos_profile_sensor_data
-        map_qos = QoSProfile(depth=1)
+        img_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
+        map_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
 
-        self.pub = self.create_publisher(FeaturesList, "live_representation", 1)
-        self.pub_match = self.create_publisher(SensorsInput, "matched_repr", 1)
+        self.pub = self.create_publisher(FeaturesList, "live_representation", 10)
+        self.pub_match = self.create_publisher(SensorsInput, "matched_repr", 10)
 
         self.sub = self.create_subscription(
             Image,
             camera_topic,
             self.image_parserCB,
             img_qos,
-            callback_group=self.cb_group
         )
 
         self.map_sub = self.create_subscription(
@@ -74,7 +72,6 @@ class RepresentationMatching(Node):
             "map_representations",
             self.map_parserCB,
             map_qos,
-            callback_group=self.cb_group
         )
 
     def parse_camera_msg(self, msg: Image):
@@ -168,7 +165,7 @@ class RepresentationMatching(Node):
 def main():
     rclpy.init()
     node = RepresentationMatching()
-    executor = MultiThreadedExecutor(num_threads=2)
+    executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
     try:
         executor.spin()

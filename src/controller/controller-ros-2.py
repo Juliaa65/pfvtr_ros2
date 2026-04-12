@@ -18,7 +18,7 @@ class ControllerNode(Node):
 
         self.declare_parameter("cmd_vel_topic", "/bluetooth_teleop/cmd_vel")
         self.declare_parameter("use_uncertainty", True)
-        self.declare_parameter("turn_gain", 0.5)
+        self.declare_parameter("turn_gain", 0.05)
         self.declare_parameter("velocity_gain", 1.0)
 
         cmd_vel_topic = self.get_parameter("cmd_vel_topic").value

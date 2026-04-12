@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, qos_profile_sensor_data
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 from pfvtr.srv import Alignment
 from sensor_processing import BearnavClassic, PF2D, VisualOnly, NNPolicy
@@ -122,13 +122,13 @@ class SensorProcessingNode(Node):
                          abs_align_topic, abs_dist_topic, rel_dist_topic, prob_dist_topic,
                          rel_align_service_name):
 
-        q1 = QoSProfile(depth=1)
+        q1 = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
         if fusion.abs_align_est is not None and len(abs_align_topic) > 0:
             self.create_subscription(
                 fusion.abs_align_est.supported_message_type,
                 abs_align_topic,
                 fusion.process_abs_alignment,
-                qos_profile_sensor_data
+                q1
             )
 
         if fusion.abs_dist_est is not None and len(abs_dist_topic) > 0:

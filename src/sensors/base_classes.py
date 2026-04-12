@@ -3,6 +3,7 @@ from typing import List
 import numpy as np
 
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 from pfvtr.msg import FloatList
 from pfvtr.msg import SensorsOutput, ImageList, Features
@@ -214,11 +215,12 @@ class SensorFusion(ABC):
         self._log = node.get_logger()
         self.type_prefix = type_prefix
 
+        qos_profile = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
         self.output_dist = node.create_publisher(
-            SensorsOutput, f"{type_prefix}/output_dist", 1
+            SensorsOutput, f"{type_prefix}/output_dist", qos_profile
         )
         self.output_align = node.create_publisher(
-            SensorsOutput, f"{type_prefix}/output_align", 1
+            SensorsOutput, f"{type_prefix}/output_align", qos_profile
         )
 
         self.set_distance_srv = node.create_service(
@@ -242,8 +244,8 @@ class SensorFusion(ABC):
         self.rel_align_est = rel_align_est
         self.repr_creator = repr_creator
 
-        self.t_dist = node.create_timer(0.025, self.publish_dist)
-        self.t_align = node.create_timer(0.025, self.publish_align)
+        self.t_dist = node.create_timer(0.01, self.publish_dist)
+        self.t_align = node.create_timer(0.01, self.publish_align)
 
 
 

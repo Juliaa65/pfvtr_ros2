@@ -13,6 +13,7 @@ from rclpy.action import ActionServer, GoalResponse, CancelResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.serialization import deserialize_message
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 import rosbag2_py
 
@@ -109,8 +110,6 @@ class RepeaterServer(Node):
     def __init__(self):
         super().__init__("repeater")
 
-        self.cb_group = ReentrantCallbackGroup()
-
         self.img = None
         self.mapName = ""
         self.mapStep = None
@@ -141,8 +140,8 @@ class RepeaterServer(Node):
 
         self.get_logger().debug("Waiting for services to become available...")
 
-        self.distance_reset_cli = self.create_client(SetDist, "repeat/set_dist", callback_group=self.cb_group)
-        self.align_reset_cli = self.create_client(SetDist, "repeat/set_align", callback_group=self.cb_group)
+        self.distance_reset_cli = self.create_client(SetDist, "repeat/set_dist")
+        self.align_reset_cli = self.create_client(SetDist, "repeat/set_align")
 
         while not self.distance_reset_cli.wait_for_service(timeout_sec=1.0):
             self.get_logger().info("Waiting for repeat/set_dist...")
@@ -150,16 +149,18 @@ class RepeaterServer(Node):
             self.get_logger().info("Waiting for repeat/set_align...")
 
 
-        self.create_service(SetClockGain, "set_clock_gain", self.setClockGain, callback_group=self.cb_group)
-        self.create_service(StopRepeater, "stop_repeater", self.stopService, callback_group=self.cb_group)
+        self.create_service(SetClockGain, "set_clock_gain", self.setClockGain)
+        self.create_service(StopRepeater, "stop_repeater", self.stopService)
+        
+        qos_profile = QoSProfile(depth=5, reliability=ReliabilityPolicy.RELIABLE)
         self.distance_sub = self.create_subscription(
-            SensorsOutput, "repeat/output_dist", self.distanceCB, 1, callback_group=self.cb_group
+            SensorsOutput, "repeat/output_dist", self.distanceCB, qos_profile,
         )
 
-        self.sensors_pub = self.create_publisher(SensorsInput, "map_representations", 1)
+        self.sensors_pub = self.create_publisher(SensorsInput, "map_representations", 10)
 
         self.joy_topic = "map_vel"
-        self.joy_pub = self.create_publisher(Twist, self.joy_topic, 1)
+        self.joy_pub = self.create_publisher(Twist, self.joy_topic, 10)
 
 
         self._action_server = ActionServer(
@@ -168,8 +169,7 @@ class RepeaterServer(Node):
             "repeater",
             execute_callback=self.actionCB,
             goal_callback=self.goal_cb,
-            cancel_callback=self.cancel_cb,
-            callback_group=self.cb_group
+            cancel_callback=self.cancel_cb
         )
 
         self.get_logger().warn("Repeater started, awaiting goal")
@@ -378,6 +378,7 @@ class RepeaterServer(Node):
         if self.action_dists is not None and len(self.action_dists) > 0 and self.isRepeating:
             distance_to_pos = abs(self.curr_dist - self.action_dists)
             closest_idx = int(np.argmin(distance_to_pos))
+            self.get_logger().info("Replaying action " + str(closest_idx) + " at distance " + str(self.action_dists[closest_idx]) + " from current position " + str(self.curr_dist))
             self.joy_pub.publish(self.actions[closest_idx])
         else:
             self.get_logger().warn("No action available - stopping")

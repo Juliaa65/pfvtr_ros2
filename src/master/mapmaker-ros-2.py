@@ -26,6 +26,7 @@ import rosbag2_py
 from pfvtr.action import MapMaker
 from pfvtr.msg import SensorsOutput, SensorsInput, DistancedTwist, Features, FeaturesList
 from pfvtr.srv import SetDist, Alignment
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 
 TARGET_WIDTH = 512
@@ -100,6 +101,8 @@ class MapmakerServer(Node):
         self.curr_trans = 0.0
         self.curr_hist = None
         self.last_saved_dist = None
+        self.last_action_dist = 0.0
+        self.action_dist_step = 0.01
         self.save_imgs = False
         self.header = None
         self.target_distances = None
@@ -152,9 +155,9 @@ class MapmakerServer(Node):
                 self.get_logger().info("Waiting for teach/local_alignment...")
             self.get_logger().warn("Local alignment service available for mapmaker")
 
-
+        odom_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
         self.get_logger().debug("Subscribing to commands")
-        self.joy_sub = self.create_subscription(TwistStamped, self.joy_topic, self.joy_cb, 100) #buff size!!!!!!!
+        self.joy_sub = self.create_subscription(TwistStamped, self.joy_topic, self.joy_cb, odom_qos)
 
         if self.odom_record_topic:
             self.add_sub = self.create_subscription(Odometry, self.odom_record_topic, self.misc_cb, 10)
@@ -234,8 +237,8 @@ class MapmakerServer(Node):
 
         self.synced_topics = ApproximateTimeSynchronizer(
             [repr_sub, distance_sub, cam_sub],
-            queue_size=50,
-            slop=2.5
+            queue_size=3,
+            slop=0.2
         )
         self.synced_topics.registerCallback(self.distance_img_cb)
 
@@ -247,8 +250,8 @@ class MapmakerServer(Node):
 
         self.synced_topics = ApproximateTimeSynchronizer(
             [repr_sub, distance_sub, align_sub, cam_sub],
-            queue_size=10,
-            slop=0.5
+            queue_size=3,
+            slop=0.2
         )
         self.synced_topics.registerCallback(self.distance_wrapper_cb)
 
@@ -321,15 +324,21 @@ class MapmakerServer(Node):
         if self.isMapping:
             if self._bag_writer is None:
                 return
-            save_msg = DistancedTwist()
-            save_msg.twist = msg.twist
-            save_msg.distance = float(self.dist)
+            if self.dist < 0.01:
+                return
+            
+            dist_delta = self.dist - self.last_action_dist
+            if dist_delta >= self.action_dist_step:
+                save_msg = DistancedTwist()
+                save_msg.twist = msg.twist
+                save_msg.distance = float(self.dist)
 
-            now_ns = self.get_clock().now().nanoseconds
-            self._bag_writer.write("/recorded_actions", serialize_message(save_msg), now_ns)
+                now_ns = self.get_clock().now().nanoseconds
+                self._bag_writer.write("/recorded_actions", serialize_message(save_msg), now_ns)
+                self.last_action_dist = self.dist
 
-            if self.lastOdom is not None:
-                self._bag_writer.write("/recorded_odometry", serialize_message(self.lastOdom), now_ns)
+                if self.lastOdom is not None:
+                    self._bag_writer.write("/recorded_odometry", serialize_message(self.lastOdom), now_ns)
 
     def goal_cb(self, goal_request):
         if goal_request.start:
@@ -435,6 +444,7 @@ class MapmakerServer(Node):
 
             self.mapName = goal.map_name
             self.nextStep = 0.0
+            self.last_action_dist = 0.0
             self.isMapping = True
             result.success = True
             goal_handle.succeed()
