@@ -22,6 +22,12 @@ NAVIGATION_QOS = QoSProfile(
     durability=DurabilityPolicy.VOLATILE
 )
 
+SYNC_FEEDER_QOS = QoSProfile(
+    depth=10,
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    durability=DurabilityPolicy.VOLATILE
+)
+
 def get_exclusive_callback_group():
     return MutuallyExclusiveCallbackGroup()
 
@@ -62,7 +68,7 @@ class RepresentationMatching(Node):
         self.bridge = CvBridge()
         cb_group = get_exclusive_callback_group()
 
-        self.pub = self.create_publisher(FeaturesList, "live_representation", NAVIGATION_QOS)
+        self.pub = self.create_publisher(FeaturesList, "live_representation", SYNC_FEEDER_QOS)
         self.pub_match = self.create_publisher(SensorsInput, "matched_repr", NAVIGATION_QOS)
 
         self.sub = self.create_subscription(

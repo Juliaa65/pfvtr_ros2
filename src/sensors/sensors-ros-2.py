@@ -14,6 +14,12 @@ NAVIGATION_QOS = QoSProfile(
     durability=DurabilityPolicy.VOLATILE
 )
 
+SYNC_FEEDER_QOS = QoSProfile(
+    depth=10,
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    durability=DurabilityPolicy.VOLATILE
+)
+
 def get_exclusive_callback_group():
     return MutuallyExclusiveCallbackGroup()
 
@@ -139,7 +145,7 @@ class SensorProcessingNode(Node):
                 fusion.abs_align_est.supported_message_type,
                 abs_align_topic,
                 fusion.process_abs_alignment,
-                NAVIGATION_QOS,
+                SYNC_FEEDER_QOS,
                 callback_group=cb_group
             )
 
@@ -148,7 +154,7 @@ class SensorProcessingNode(Node):
                 fusion.abs_dist_est.supported_message_type,
                 abs_dist_topic,
                 fusion.process_abs_distance,
-                NAVIGATION_QOS,
+                SYNC_FEEDER_QOS,
                 callback_group=cb_group
             )
 
@@ -157,7 +163,7 @@ class SensorProcessingNode(Node):
                 fusion.rel_dist_est.supported_message_type,
                 rel_dist_topic,
                 fusion.process_rel_distance,
-                NAVIGATION_QOS,
+                SYNC_FEEDER_QOS,
                 callback_group=cb_group
             )
 
@@ -166,7 +172,7 @@ class SensorProcessingNode(Node):
                 fusion.prob_dist_est.supported_message_type,
                 prob_dist_topic,
                 fusion.process_prob_distance,
-                NAVIGATION_QOS,
+                SYNC_FEEDER_QOS,
                 callback_group=cb_group
             )
 

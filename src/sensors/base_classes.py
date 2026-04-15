@@ -15,6 +15,12 @@ NAVIGATION_QOS = QoSProfile(
     durability=DurabilityPolicy.VOLATILE
 )
 
+SYNC_FEEDER_QOS = QoSProfile(
+    depth=10,
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    durability=DurabilityPolicy.VOLATILE
+)
+
 
 """
 These are base classes for sensor modules in this package
@@ -222,10 +228,10 @@ class SensorFusion(ABC):
         self.type_prefix = type_prefix
 
         self.output_dist = node.create_publisher(
-            SensorsOutput, f"{type_prefix}/output_dist", NAVIGATION_QOS
+            SensorsOutput, f"{type_prefix}/output_dist", SYNC_FEEDER_QOS
         )
         self.output_align = node.create_publisher(
-            SensorsOutput, f"{type_prefix}/output_align", NAVIGATION_QOS
+            SensorsOutput, f"{type_prefix}/output_align", SYNC_FEEDER_QOS
         )
 
         self.set_distance_srv = node.create_service(

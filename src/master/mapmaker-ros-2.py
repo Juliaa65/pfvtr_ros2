@@ -34,6 +34,12 @@ NAVIGATION_QOS = QoSProfile(
     durability=DurabilityPolicy.VOLATILE
 )
 
+SYNC_QOS = QoSProfile(
+    depth=10,
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    durability=DurabilityPolicy.VOLATILE
+)
+
 
 TARGET_WIDTH = 512
 
@@ -236,27 +242,27 @@ class MapmakerServer(Node):
             self.align_in_progress = True
 
     def _setup_teach_sync(self):
-        repr_sub = Subscriber(self, FeaturesList, "live_representation", qos_profile=NAVIGATION_QOS)
-        cam_sub = Subscriber(self, Image, self.camera_topic, qos_profile=NAVIGATION_QOS)
-        distance_sub = Subscriber(self, SensorsOutput, "teach/output_dist", qos_profile=NAVIGATION_QOS)
+        repr_sub = Subscriber(self, FeaturesList, "live_representation", qos_profile=SYNC_QOS)
+        cam_sub = Subscriber(self, Image, self.camera_topic, qos_profile=SYNC_QOS)
+        distance_sub = Subscriber(self, SensorsOutput, "teach/output_dist", qos_profile=SYNC_QOS)
 
         self.synced_topics = ApproximateTimeSynchronizer(
             [repr_sub, distance_sub, cam_sub],
-            queue_size=3,
-            slop=0.2
+            queue_size=10,
+            slop=0.3
         )
         self.synced_topics.registerCallback(self.distance_img_cb)
 
     def _setup_repeat_sync(self):
-        repr_sub = Subscriber(self, FeaturesList, "live_representation", qos_profile=NAVIGATION_QOS)
-        cam_sub = Subscriber(self, Image, self.camera_topic, qos_profile=NAVIGATION_QOS)
-        distance_sub = Subscriber(self, SensorsOutput, "repeat/output_dist", qos_profile=NAVIGATION_QOS)
-        align_sub = Subscriber(self, SensorsOutput, "repeat/output_align", qos_profile=NAVIGATION_QOS)
+        repr_sub = Subscriber(self, FeaturesList, "live_representation", qos_profile=SYNC_QOS)
+        cam_sub = Subscriber(self, Image, self.camera_topic, qos_profile=SYNC_QOS)
+        distance_sub = Subscriber(self, SensorsOutput, "repeat/output_dist", qos_profile=SYNC_QOS)
+        align_sub = Subscriber(self, SensorsOutput, "repeat/output_align", qos_profile=SYNC_QOS)
 
         self.synced_topics = ApproximateTimeSynchronizer(
             [repr_sub, distance_sub, align_sub, cam_sub],
-            queue_size=3,
-            slop=0.2
+            queue_size=10,
+            slop=0.3
         )
         self.synced_topics.registerCallback(self.distance_wrapper_cb)
 
