@@ -12,6 +12,7 @@ from rclpy.node import Node
 from rclpy.action import ActionServer, GoalResponse, CancelResponse
 from rclpy.serialization import serialize_message
 from rclpy.parameter import Parameter
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import Twist, TwistStamped
@@ -26,7 +27,12 @@ import rosbag2_py
 from pfvtr.action import MapMaker
 from pfvtr.msg import SensorsOutput, SensorsInput, DistancedTwist, Features, FeaturesList
 from pfvtr.srv import SetDist, Alignment
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+
+NAVIGATION_QOS = QoSProfile(
+    depth=1,
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    durability=DurabilityPolicy.VOLATILE
+)
 
 
 TARGET_WIDTH = 512
@@ -155,12 +161,11 @@ class MapmakerServer(Node):
                 self.get_logger().info("Waiting for teach/local_alignment...")
             self.get_logger().warn("Local alignment service available for mapmaker")
 
-        odom_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
         self.get_logger().debug("Subscribing to commands")
-        self.joy_sub = self.create_subscription(TwistStamped, self.joy_topic, self.joy_cb, odom_qos)
+        self.joy_sub = self.create_subscription(TwistStamped, self.joy_topic, self.joy_cb, NAVIGATION_QOS)
 
         if self.odom_record_topic:
-            self.add_sub = self.create_subscription(Odometry, self.odom_record_topic, self.misc_cb, 10)
+            self.add_sub = self.create_subscription(Odometry, self.odom_record_topic, self.misc_cb, NAVIGATION_QOS)
 
         self.get_logger().debug("Starting mapmaker action server")
         self._action_server = ActionServer(
@@ -231,9 +236,9 @@ class MapmakerServer(Node):
             self.align_in_progress = True
 
     def _setup_teach_sync(self):
-        repr_sub = Subscriber(self, FeaturesList, "live_representation")
-        cam_sub = Subscriber(self, Image, self.camera_topic)
-        distance_sub = Subscriber(self, SensorsOutput, "teach/output_dist")
+        repr_sub = Subscriber(self, FeaturesList, "live_representation", qos_profile=NAVIGATION_QOS)
+        cam_sub = Subscriber(self, Image, self.camera_topic, qos_profile=NAVIGATION_QOS)
+        distance_sub = Subscriber(self, SensorsOutput, "teach/output_dist", qos_profile=NAVIGATION_QOS)
 
         self.synced_topics = ApproximateTimeSynchronizer(
             [repr_sub, distance_sub, cam_sub],
@@ -243,10 +248,10 @@ class MapmakerServer(Node):
         self.synced_topics.registerCallback(self.distance_img_cb)
 
     def _setup_repeat_sync(self):
-        repr_sub = Subscriber(self, FeaturesList, "live_representation")
-        cam_sub = Subscriber(self, Image, self.camera_topic)
-        distance_sub = Subscriber(self, SensorsOutput, "repeat/output_dist")
-        align_sub = Subscriber(self, SensorsOutput, "repeat/output_align")
+        repr_sub = Subscriber(self, FeaturesList, "live_representation", qos_profile=NAVIGATION_QOS)
+        cam_sub = Subscriber(self, Image, self.camera_topic, qos_profile=NAVIGATION_QOS)
+        distance_sub = Subscriber(self, SensorsOutput, "repeat/output_dist", qos_profile=NAVIGATION_QOS)
+        align_sub = Subscriber(self, SensorsOutput, "repeat/output_align", qos_profile=NAVIGATION_QOS)
 
         self.synced_topics = ApproximateTimeSynchronizer(
             [repr_sub, distance_sub, align_sub, cam_sub],

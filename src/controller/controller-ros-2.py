@@ -1,13 +1,23 @@
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rcl_interfaces.msg import SetParametersResult
 
 from geometry_msgs.msg import Twist
 from pfvtr.msg import SensorsOutput
 from pfvtr.srv import SetClockGain
-
 import controller
+
+NAVIGATION_QOS = QoSProfile(
+    depth=1,
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    durability=DurabilityPolicy.VOLATILE
+)
+
+def get_exclusive_callback_group():
+    return MutuallyExclusiveCallbackGroup()
 
 
 class ControllerNode(Node):
@@ -22,10 +32,12 @@ class ControllerNode(Node):
         self.declare_parameter("velocity_gain", 1.0)
 
         cmd_vel_topic = self.get_parameter("cmd_vel_topic").value
-        self.pub = self.create_publisher(Twist, cmd_vel_topic, 10)
+        cb_group = get_exclusive_callback_group()
 
-        self.sub_vel = self.create_subscription(Twist, "map_vel", self.callbackVel, 10)
-        self.sub_corr = self.create_subscription(SensorsOutput, "repeat/output_align", self.callbackCorr, 10)
+        self.pub = self.create_publisher(Twist, cmd_vel_topic, NAVIGATION_QOS)
+
+        self.sub_vel = self.create_subscription(Twist, "map_vel", self.callbackVel, NAVIGATION_QOS, callback_group=cb_group)
+        self.sub_corr = self.create_subscription(SensorsOutput, "repeat/output_align", self.callbackCorr, NAVIGATION_QOS, callback_group=cb_group)
 
         self.gain_client = self.create_client(SetClockGain, "set_clock_gain")
         self._apply_controller_params()

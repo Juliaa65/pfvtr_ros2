@@ -3,11 +3,17 @@ from typing import List
 import numpy as np
 
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
 from pfvtr.msg import FloatList
 from pfvtr.msg import SensorsOutput, ImageList, Features
 from pfvtr.srv import SetDist, Representations
+
+NAVIGATION_QOS = QoSProfile(
+    depth=1,
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    durability=DurabilityPolicy.VOLATILE
+)
 
 
 """
@@ -215,12 +221,11 @@ class SensorFusion(ABC):
         self._log = node.get_logger()
         self.type_prefix = type_prefix
 
-        qos_profile = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
         self.output_dist = node.create_publisher(
-            SensorsOutput, f"{type_prefix}/output_dist", qos_profile
+            SensorsOutput, f"{type_prefix}/output_dist", NAVIGATION_QOS
         )
         self.output_align = node.create_publisher(
-            SensorsOutput, f"{type_prefix}/output_align", qos_profile
+            SensorsOutput, f"{type_prefix}/output_align", NAVIGATION_QOS
         )
 
         self.set_distance_srv = node.create_service(
@@ -243,9 +248,6 @@ class SensorFusion(ABC):
         self.abs_align_est = abs_align_est
         self.rel_align_est = rel_align_est
         self.repr_creator = repr_creator
-
-        self.t_dist = node.create_timer(0.01, self.publish_dist)
-        self.t_align = node.create_timer(0.01, self.publish_align)
 
 
 
@@ -286,20 +288,18 @@ class SensorFusion(ABC):
     def set_distance(self, request: SetDist.Request, response: SetDist.Response):
         self.distance = request.dist
         self.distance_std = 0.0
-        # Initialize to first map (index 0)
-        # PF2D overrides this via particle filter estimation
-        self.map = 0
+        self.map = getattr(request, 'map_num', 0)
         if self.abs_dist_est is not None:
             self.abs_dist_est.set_dist(self.distance)
         if self.prob_dist_est is not None:
             self.prob_dist_est.set_dist(self.distance)
+        self.publish_dist()
         return response
 
     def set_alignment(self, request: SetDist.Request, response: SetDist.Response):
         self.alignment = request.dist
         self.alignment_std = 0.0
-        if request.dist == 0.0:
-            self.publish_align()
+        self.publish_align()
         return response
 
 
@@ -320,18 +320,22 @@ class SensorFusion(ABC):
     def process_abs_alignment(self, msg):
         if self.alignment is not None:
             self._process_abs_alignment(msg)
+            self.publish_align()
 
     def process_rel_distance(self, msg):
         if self.distance is not None:
             self._process_rel_distance(msg)
+            self.publish_dist()
 
     def process_abs_distance(self, msg):
         if self.distance is not None:
             self._process_abs_distance(msg)
+            self.publish_dist()
 
     def process_prob_distance(self, msg):
         if self.distance is not None:
             self._process_prob_distance(msg)
+            self.publish_dist()
 
     @abstractmethod
     def _process_rel_alignment(self, request, response):

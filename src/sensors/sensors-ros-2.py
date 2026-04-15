@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 
 from pfvtr.srv import Alignment
 from sensor_processing import BearnavClassic, PF2D, VisualOnly, NNPolicy
-from rclpy.executors import MultiThreadedExecutor
+
+NAVIGATION_QOS = QoSProfile(
+    depth=1,
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    durability=DurabilityPolicy.VOLATILE
+)
+
+def get_exclusive_callback_group():
+    return MutuallyExclusiveCallbackGroup()
 
 from backends.odometry.odom_dist import OdometryAbsolute, OdometryRelative
 from backends.siamese.siamese import SiameseCNN
@@ -122,13 +132,15 @@ class SensorProcessingNode(Node):
                          abs_align_topic, abs_dist_topic, rel_dist_topic, prob_dist_topic,
                          rel_align_service_name):
 
-        q1 = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
+        cb_group = get_exclusive_callback_group()
+
         if fusion.abs_align_est is not None and len(abs_align_topic) > 0:
             self.create_subscription(
                 fusion.abs_align_est.supported_message_type,
                 abs_align_topic,
                 fusion.process_abs_alignment,
-                q1
+                NAVIGATION_QOS,
+                callback_group=cb_group
             )
 
         if fusion.abs_dist_est is not None and len(abs_dist_topic) > 0:
@@ -136,7 +148,8 @@ class SensorProcessingNode(Node):
                 fusion.abs_dist_est.supported_message_type,
                 abs_dist_topic,
                 fusion.process_abs_distance,
-                q1
+                NAVIGATION_QOS,
+                callback_group=cb_group
             )
 
         if fusion.rel_dist_est is not None and len(rel_dist_topic) > 0:
@@ -144,7 +157,8 @@ class SensorProcessingNode(Node):
                 fusion.rel_dist_est.supported_message_type,
                 rel_dist_topic,
                 fusion.process_rel_distance,
-                q1
+                NAVIGATION_QOS,
+                callback_group=cb_group
             )
 
         if fusion.prob_dist_est is not None and len(prob_dist_topic) > 0:
@@ -152,7 +166,8 @@ class SensorProcessingNode(Node):
                 fusion.prob_dist_est.supported_message_type,
                 prob_dist_topic,
                 fusion.process_prob_distance,
-                q1
+                NAVIGATION_QOS,
+                callback_group=cb_group
             )
 
         if fusion.rel_align_est is not None and len(rel_align_service_name) > 0:

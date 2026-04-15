@@ -4,19 +4,26 @@ from copy import copy
 
 import rclpy
 from rclpy.node import Node
-from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
-from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 import cv2
 
 from pfvtr.msg import FeaturesList, ImageList, Features, SensorsInput, Histogram
-
-
 from backends.siamese.siamese import SiameseCNN
 from backends.siamese.siamfeature import SiamFeature
+
+NAVIGATION_QOS = QoSProfile(
+    depth=1,
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    durability=DurabilityPolicy.VOLATILE
+)
+
+def get_exclusive_callback_group():
+    return MutuallyExclusiveCallbackGroup()
 
 
 # Network hyperparameters (same as ROS1)
@@ -53,25 +60,25 @@ class RepresentationMatching(Node):
         self.sns_in_msg = None
 
         self.bridge = CvBridge()
+        cb_group = get_exclusive_callback_group()
 
-        img_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
-        map_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
-
-        self.pub = self.create_publisher(FeaturesList, "live_representation", 10)
-        self.pub_match = self.create_publisher(SensorsInput, "matched_repr", 10)
+        self.pub = self.create_publisher(FeaturesList, "live_representation", NAVIGATION_QOS)
+        self.pub_match = self.create_publisher(SensorsInput, "matched_repr", NAVIGATION_QOS)
 
         self.sub = self.create_subscription(
             Image,
             camera_topic,
             self.image_parserCB,
-            img_qos,
+            NAVIGATION_QOS,
+            callback_group=cb_group
         )
 
         self.map_sub = self.create_subscription(
             SensorsInput,
             "map_representations",
             self.map_parserCB,
-            map_qos,
+            NAVIGATION_QOS,
+            callback_group=cb_group
         )
 
     def parse_camera_msg(self, msg: Image):

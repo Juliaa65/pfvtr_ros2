@@ -10,10 +10,10 @@ import rclpy
 from rclpy.node import Node
 from rclpy.time import Time
 from rclpy.action import ActionServer, GoalResponse, CancelResponse
-from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.serialization import deserialize_message
-from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 import rosbag2_py
 
@@ -25,6 +25,15 @@ from cv_bridge import CvBridge
 from pfvtr.action import MapRepeater
 from pfvtr.msg import SensorsInput, SensorsOutput, Features, Histogram, DistancedTwist
 from pfvtr.srv import SetDist, SetClockGain, StopRepeater
+
+NAVIGATION_QOS = QoSProfile(
+    depth=1,
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    durability=DurabilityPolicy.VOLATILE
+)
+
+def get_exclusive_callback_group():
+    return MutuallyExclusiveCallbackGroup()
 
 
 
@@ -152,15 +161,16 @@ class RepeaterServer(Node):
         self.create_service(SetClockGain, "set_clock_gain", self.setClockGain)
         self.create_service(StopRepeater, "stop_repeater", self.stopService)
         
-        qos_profile = QoSProfile(depth=5, reliability=ReliabilityPolicy.RELIABLE)
+        cb_group = get_exclusive_callback_group()
         self.distance_sub = self.create_subscription(
-            SensorsOutput, "repeat/output_dist", self.distanceCB, qos_profile,
+            SensorsOutput, "repeat/output_dist", self.distanceCB, NAVIGATION_QOS,
+            callback_group=cb_group
         )
 
-        self.sensors_pub = self.create_publisher(SensorsInput, "map_representations", 10)
+        self.sensors_pub = self.create_publisher(SensorsInput, "map_representations", NAVIGATION_QOS)
 
         self.joy_topic = "map_vel"
-        self.joy_pub = self.create_publisher(Twist, self.joy_topic, 10)
+        self.joy_pub = self.create_publisher(Twist, self.joy_topic, NAVIGATION_QOS)
 
 
         self._action_server = ActionServer(
