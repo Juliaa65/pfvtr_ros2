@@ -6,7 +6,7 @@ from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 
 from pfvtr.srv import Alignment
-from sensor_processing import BearnavClassic, PF2D, VisualOnly, NNPolicy
+from sensor_processing import BearnavClassic, PF2D, VisualOnly  # , NNPolicy
 
 NAVIGATION_QOS = QoSProfile(
     depth=1,
