@@ -36,7 +36,7 @@ class VTRControlGUI(Node):
         self.refresh_maps_list()
         
         # Periodic ROS2 spinning
-        self.root.after(100, self.spin_ros)
+        self.root.after(20, self.spin_ros)
     
     def setup_mapping_frame(self):
         mapping_frame = ttk.LabelFrame(self.root, text="Mapping Controls", padding=10)
@@ -348,8 +348,12 @@ class VTRControlGUI(Node):
         self.repeating_goal_handle = None
     
     def spin_ros(self):
-        rclpy.spin_once(self, timeout_sec=0.01)
-        self.root.after(100, self.spin_ros)
+        # Drain pending ROS work each tick so high-rate subscriptions aren't
+        # starved. spin_once(timeout_sec=0.0) is non-blocking and processes at
+        # most one work item, so we loop with a cap.
+        for _ in range(100):
+            rclpy.spin_once(self, timeout_sec=0.0)
+        self.root.after(20, self.spin_ros)
     
     def run(self):
         self.root.mainloop()
