@@ -2,6 +2,8 @@
 import os
 import time
 import shutil
+import threading
+from queue import Queue
 
 
 import numpy as np
@@ -100,6 +102,16 @@ class MapmakerServer(Node):
 
         self.bridge = CvBridge()
 
+        # Background worker that serializes waypoint writes to disk so that
+        # cv2.imwrite + np.save do not block the rclpy executor thread. Both
+        # release the GIL during file I/O, so a plain daemon thread keeps
+        # sync callbacks firing while the previous waypoint is still on disk.
+        self._save_queue: Queue = Queue()
+        self._save_worker = threading.Thread(
+            target=self._save_worker_loop, daemon=True, name="mapmaker-save-worker"
+        )
+        self._save_worker.start()
+
         self.isMapping = False
         self.img_msg = None
         self.last_img_msg = None
@@ -108,6 +120,7 @@ class MapmakerServer(Node):
         self.mapName = ""
         self.mapStep = 1.0
         self.nextStep = 0.0
+        self._startup_skip_count = 0  # flush stale sync-queue triples after START
         self.visual_turn = True
         self.max_trans = 0.3
         self.curr_trans = 0.0
@@ -191,6 +204,22 @@ class MapmakerServer(Node):
         self._bag_open = False
 
         self.get_logger().warn("Mapmaker started, awaiting goal")
+
+    def _save_worker_loop(self):
+        while True:
+            item = self._save_queue.get()
+            try:
+                if item is None:
+                    return
+                save_img(*item)
+            except Exception as e:
+                # Logger may be GC'd during shutdown; guard the logging call.
+                try:
+                    self.get_logger().error(f"save_img failed in worker: {e}")
+                except Exception:
+                    print(f"save_img failed in worker: {e}")
+            finally:
+                self._save_queue.task_done()
 
     def call_service_blocking(self, client, service_name: str, req, timeout_sec: float = 5.0):
         self.get_logger().info(f"Calling {service_name}...")
@@ -293,6 +322,14 @@ class MapmakerServer(Node):
         if not self.isMapping:
             return
 
+        # Flush any sync triples that were buffered before isMapping flipped.
+        # With slop=0.3s + queue_size=10, pre-start messages can still pair
+        # with fresh post-start ones and fire a callback whose `dist` is stale
+        # relative to the teach/set_dist reset that happened just before.
+        if self._startup_skip_count > 0:
+            self._startup_skip_count -= 1
+            return
+
         # obtain displacement between prev and new image
         if self.visual_turn and self.last_img_features is not None and dist:
             srv_msg = SensorsInput()
@@ -310,20 +347,20 @@ class MapmakerServer(Node):
             self.last_img_features = self.img_features
             if self.collected_distances[desired_idx] == 0 and self.target_distances[desired_idx] <= dist:
                 self.collected_distances[desired_idx] = 1
-                save_img(
+                self._save_queue.put((
                     self.img_features, self.img_msg, self.header, self.mapName, dist,
                     self.curr_hist, self.curr_alignment, self.source_map, self.save_imgs, self.bridge
-                )
+                ))
                 self.get_logger().info(f"Saved waypoint: {dist}, {self.curr_trans}")
 
         # save after fixed distance OR visual turn threshold
         if self.target_distances is None and (dist > self.nextStep or abs(self.curr_trans) > self.max_trans):
             self.nextStep = dist + self.mapStep
             self.last_img_features = self.img_features
-            save_img(
+            self._save_queue.put((
                 self.img_features, self.img_msg, self.header, self.mapName, dist,
                 self.curr_hist, self.curr_alignment, self.source_map, self.save_imgs, self.bridge
-            )
+            ))
             self.get_logger().info(f"Saved waypoint: {dist}, {self.curr_trans}")
 
         if self.last_img_features is None:
@@ -456,6 +493,7 @@ class MapmakerServer(Node):
             self.mapName = goal.map_name
             self.nextStep = 0.0
             self.last_action_dist = 0.0
+            self._startup_skip_count = 3
             self.isMapping = True
             result.success = True
             goal_handle.succeed()
@@ -465,11 +503,11 @@ class MapmakerServer(Node):
             # stop mapping
             if self.target_distances is None:
                 if self.header is not None and self.img_msg is not None and self.img_features is not None:
-                    save_img(
+                    self._save_queue.put((
                         self.img_features, self.img_msg, self.header, self.mapName,
                         float(self.dist), self.curr_hist, self.curr_alignment,
                         self.source_map, self.save_imgs, self.bridge
-                    )
+                    ))
                     self.get_logger().info(f"Creating final wp at dist: {self.dist}")
                 else:
                     self.get_logger().warn(
@@ -483,6 +521,9 @@ class MapmakerServer(Node):
 
             time.sleep(2)
             self.isMapping = False
+            # Block until every queued waypoint is flushed to disk before
+            # we return success, so the map directory is complete.
+            self._save_queue.join()
             result.success = True
             goal_handle.succeed()
 
