@@ -7,7 +7,10 @@ import glob
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+from nav_msgs.msg import Odometry
 from pfvtr.action import MapMaker, MapRepeater
+from pfvtr.msg import FeaturesList
 
 
 class VTRControlGUI(Node):
@@ -28,6 +31,7 @@ class VTRControlGUI(Node):
         self.setup_mapping_frame()
         self.setup_repeating_frame()
         self.setup_status_bar()
+        self.setup_hz_frame()
         
         self.refresh_maps_list()
         
@@ -133,6 +137,53 @@ class VTRControlGUI(Node):
         
         scrollbar = ttk.Scrollbar(status_frame, command=self.status_text.yview)
         self.status_text.configure(yscrollcommand=scrollbar.set)
+
+    def setup_hz_frame(self):
+        hz_frame = ttk.LabelFrame(self.root, text="Topic Rates", padding=5)
+        hz_frame.pack(fill='x', padx=10, pady=5)
+
+        self.hz_label = ttk.Label(hz_frame, text="Cam: --   LiveRepr: --   Odom: --")
+        self.hz_label.pack(side='left', padx=5)
+
+        self.hz_btn = ttk.Button(hz_frame, text="Measure", command=self.start_hz_measurement)
+        self.hz_btn.pack(side='right', padx=5)
+
+        self.odom_count = 0
+        self.repr_count = 0
+        self._odom_sub = None
+        self._repr_sub = None
+
+    def start_hz_measurement(self):
+        self.hz_btn['state'] = 'disabled'
+        self.hz_label.config(text="Measuring...")
+        self.odom_count = 0
+        self.repr_count = 0
+
+        hz_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT, durability=DurabilityPolicy.VOLATILE)
+        self._odom_sub = self.create_subscription(Odometry, '/odometry_publisher', self._odom_cb, hz_qos)
+        self._repr_sub = self.create_subscription(FeaturesList, '/pfvtr/live_representation', self._repr_cb, hz_qos)
+        self.root.after(3000, self.finish_hz_measurement)
+
+    def _odom_cb(self, msg):
+        self.odom_count += 1
+
+    def _repr_cb(self, msg):
+        self.repr_count += 1
+
+    def finish_hz_measurement(self):
+        if self._odom_sub is not None:
+            self.destroy_subscription(self._odom_sub)
+            self._odom_sub = None
+        if self._repr_sub is not None:
+            self.destroy_subscription(self._repr_sub)
+            self._repr_sub = None
+
+        odom_hz = self.odom_count / 3.0
+        repr_hz = self.repr_count / 3.0
+        cam_hz = odom_hz
+
+        self.hz_label.config(text=f"Cam: {cam_hz:.1f} Hz   LiveRepr: {repr_hz:.1f} Hz   Odom: {odom_hz:.1f} Hz")
+        self.hz_btn['state'] = 'normal'
     
     def log_status(self, message):
         self.status_text.configure(state='normal')
