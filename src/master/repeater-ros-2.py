@@ -510,7 +510,12 @@ class RepeaterServer(Node):
 
         req = SetDist.Request()
         req.dist = float(goal.start_pos)
-        req.map_num = int(self.map_num)
+        # `map_num` is stored by the sensors node as the active map INDEX
+        # (base_classes.py set_distance -> self.map = request.map_num),
+        # and later published as SensorsOutput.map which is used to index
+        # into self.map_distances. It must be 0-based. Passing the count
+        # (self.map_num) causes an off-by-one IndexError in distanceCB.
+        req.map_num = 0
         self.distance_reset_cli.call(req)
 
         self.curr_dist = float(goal.start_pos)
