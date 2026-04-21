@@ -66,6 +66,28 @@ class RepresentationMatching(Node):
         self.sns_in_msg = None
 
         self.bridge = CvBridge()
+
+        # Pre-warm the CNN before any subscription fires. The first GPU
+        # inference pays a one-time cost (CUDA context, kernel JIT, cuDNN
+        # algorithm selection, model-to-GPU transfer) that on a Jetson can
+        # run 5-15s. Absorbing it here means the first real camera frame
+        # hits an already-warm model, so the matching pipeline starts
+        # flowing immediately once the repeater is active — rather than
+        # the robot traversing several metres before alignment kicks in.
+        try:
+            dummy = np.zeros((RESIZE_W, RESIZE_W, 3), dtype=np.uint8)
+            dummy_msg = self.bridge.cv2_to_imgmsg(dummy, encoding="rgb8")
+            warm_in = ImageList()
+            warm_in.data = [dummy_msg]
+            t0 = self.get_clock().now()
+            _ = self.align_abs._to_feature(warm_in)
+            dt = (self.get_clock().now() - t0).nanoseconds / 1e9
+            self.get_logger().warn(f"NN warmed up in {dt:.2f}s")
+        except Exception as e:
+            self.get_logger().warn(
+                f"NN warmup failed (will warm on first frame): {e}"
+            )
+
         cb_group = get_exclusive_callback_group()
 
         self.pub = self.create_publisher(FeaturesList, "live_representation", SYNC_FEEDER_QOS)
