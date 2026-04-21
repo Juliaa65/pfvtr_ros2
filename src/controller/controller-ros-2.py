@@ -28,7 +28,7 @@ class ControllerNode(Node):
 
         self.declare_parameter("cmd_vel_topic", "/bluetooth_teleop/cmd_vel")
         self.declare_parameter("use_uncertainty", True)
-        self.declare_parameter("turn_gain", 0.05)
+        self.declare_parameter("turn_gain", 1.0)
         self.declare_parameter("velocity_gain", 1.0)
 
         cmd_vel_topic = self.get_parameter("cmd_vel_topic").value
@@ -56,6 +56,11 @@ class ControllerNode(Node):
                 "turn_gain": turn_gain,
                 "use_uncertainty": use_uncertainty
             })
+
+        self.get_logger().warn(
+            f"Controller params applied: turn_gain={turn_gain} "
+            f"velocity_gain={velocity_gain} use_uncertainty={use_uncertainty}"
+        )
 
         self._set_clock_gain_from_velocity(velocity_gain)
 

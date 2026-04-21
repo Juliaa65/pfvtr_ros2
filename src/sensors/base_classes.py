@@ -243,9 +243,15 @@ class SensorFusion(ABC):
 
         self.header = None
         self.distance = None
-        self.alignment = None
+        # Default alignment to 0.0 (zero displacement) instead of None so that
+        # `process_abs_alignment` is never gated waiting for the first successful
+        # set_align service call. On a fresh DDS stack the repeater's sync
+        # service call can silently race/fail and leave this as None forever,
+        # which disables correction for the entire run. The first real histogram
+        # overwrites this default immediately.
+        self.alignment = 0.0
         self.distance_std = None
-        self.alignment_std = None
+        self.alignment_std = 0.0
         self.map = 0
 
         self.abs_dist_est = abs_dist_est
