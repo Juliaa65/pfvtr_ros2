@@ -18,7 +18,7 @@ from rclpy.serialization import deserialize_message
 import rosbag2_py
 
 from sensor_msgs.msg import Image
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, TwistStamped
 
 from cv_bridge import CvBridge
 
@@ -170,7 +170,7 @@ class RepeaterServer(Node):
         self.sensors_pub = self.create_publisher(SensorsInput, "map_representations", NAVIGATION_QOS)
 
         self.joy_topic = "map_vel"
-        self.joy_pub = self.create_publisher(Twist, self.joy_topic, NAVIGATION_QOS)
+        self.joy_pub = self.create_publisher(TwistStamped, self.joy_topic, NAVIGATION_QOS)
 
 
         self._action_server = ActionServer(
@@ -384,19 +384,29 @@ class RepeaterServer(Node):
             self.get_logger().warn("WARNING: No action commands found in rosbag!")
             self.action_dists = None
 
+    def _publish_vel(self, twist: Twist):
+        # Wrap the stored plain Twist (from DistancedTwist.twist) in a
+        # TwistStamped so downstream consumers (controller, robot base)
+        # that subscribe with TwistStamped actually receive it.
+        out = TwistStamped()
+        out.header.stamp = self.get_clock().now().to_msg()
+        out.header.frame_id = "base_link"
+        out.twist = twist
+        self.joy_pub.publish(out)
+
     def play_closest_action(self):
         if self.action_dists is not None and len(self.action_dists) > 0 and self.isRepeating:
             distance_to_pos = abs(self.curr_dist - self.action_dists)
             closest_idx = int(np.argmin(distance_to_pos))
             self.get_logger().info("Replaying action " + str(closest_idx) + " at distance " + str(self.action_dists[closest_idx]) + " from current position " + str(self.curr_dist))
-            self.joy_pub.publish(self.actions[closest_idx])
+            self._publish_vel(self.actions[closest_idx])
         else:
             self.get_logger().warn("No action available - stopping")
             req = SetDist.Request()
             req.dist = 0.0
             req.map_num = 1
             self.align_reset_cli.call(req)
-            self.joy_pub.publish(Twist())
+            self._publish_vel(Twist())
 
 
     def replay_timewise(self, bag_uri: str):
@@ -436,7 +446,7 @@ class RepeaterServer(Node):
                 if type_by_name.get(topic, "") != expected:
                     raise RuntimeError(f"Unexpected type on {topic}: {type_by_name.get(topic,'')}")
                 msg = deserialize_message(data, DistancedTwist)
-                self.joy_pub.publish(msg.twist)
+                self._publish_vel(msg.twist)
             else:
 
                 pass

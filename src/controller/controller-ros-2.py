@@ -5,7 +5,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rcl_interfaces.msg import SetParametersResult
 
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, TwistStamped
 from pfvtr.msg import SensorsOutput
 from pfvtr.srv import SetClockGain
 import controller
@@ -34,9 +34,9 @@ class ControllerNode(Node):
         cmd_vel_topic = self.get_parameter("cmd_vel_topic").value
         cb_group = get_exclusive_callback_group()
 
-        self.pub = self.create_publisher(Twist, cmd_vel_topic, NAVIGATION_QOS)
+        self.pub = self.create_publisher(TwistStamped, cmd_vel_topic, NAVIGATION_QOS)
 
-        self.sub_vel = self.create_subscription(Twist, "map_vel", self.callbackVel, NAVIGATION_QOS, callback_group=cb_group)
+        self.sub_vel = self.create_subscription(TwistStamped, "map_vel", self.callbackVel, NAVIGATION_QOS, callback_group=cb_group)
         self.sub_corr = self.create_subscription(SensorsOutput, "repeat/output_align", self.callbackCorr, NAVIGATION_QOS, callback_group=cb_group)
 
         self.gain_client = self.create_client(SetClockGain, "set_clock_gain")
@@ -59,9 +59,15 @@ class ControllerNode(Node):
 
         self._set_clock_gain_from_velocity(velocity_gain)
 
-    def callbackVel(self, msg: Twist):
-        driven = self.c.process(msg)
-        self.pub.publish(driven)
+    def callbackVel(self, msg: TwistStamped):
+        # controller.process() operates on a plain Twist; unwrap, process,
+        # then restamp on the way out so subscribers (robot base, mapmaker)
+        # that expect TwistStamped on /cmd_vel still receive it.
+        driven = self.c.process(msg.twist)
+        out = TwistStamped()
+        out.header = msg.header
+        out.twist = driven
+        self.pub.publish(out)
 
     def callbackCorr(self, msg: SensorsOutput):
         self.c.correction(msg)
