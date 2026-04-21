@@ -88,8 +88,13 @@ class RepresentationMatching(Node):
                 f"NN warmup failed (will warm on first frame): {e}"
             )
 
-        cb_group = get_exclusive_callback_group()
-
+        # Two subscriptions, two *separate* mutually-exclusive callback groups.
+        # A single shared group would serialise image_parserCB (slow CNN) with
+        # map_parserCB (tiny assignment), starving map_parserCB whenever the
+        # camera pushes frames faster than the CNN can process them, which
+        # leaves self.sns_in_msg = None forever and silently disables matching.
+        # Each callback still runs non-reentrant with itself, but the two can
+        # now run in parallel on the MultiThreadedExecutor's threads.
         self.pub = self.create_publisher(FeaturesList, "live_representation", SYNC_FEEDER_QOS)
         self.pub_match = self.create_publisher(SensorsInput, "matched_repr", NAVIGATION_QOS)
 
@@ -98,7 +103,7 @@ class RepresentationMatching(Node):
             camera_topic,
             self.image_parserCB,
             NAVIGATION_QOS,
-            callback_group=cb_group
+            callback_group=get_exclusive_callback_group()
         )
 
         self.map_sub = self.create_subscription(
@@ -106,7 +111,7 @@ class RepresentationMatching(Node):
             "map_representations",
             self.map_parserCB,
             NAVIGATION_QOS,
-            callback_group=cb_group
+            callback_group=get_exclusive_callback_group()
         )
 
     def parse_camera_msg(self, msg: Image):
