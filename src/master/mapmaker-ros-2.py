@@ -438,7 +438,7 @@ class MapmakerServer(Node):
         self._bag_writer = None
         self._bag_open = False
 
-    def action_cb(self, goal_handle):
+    async def action_cb(self, goal_handle):
         self._active_goal_handle = goal_handle
         goal = goal_handle.request
         result = MapMaker.Result()
@@ -468,7 +468,17 @@ class MapmakerServer(Node):
             req = SetDist.Request()
             req.dist = 0.0
             req.map_num = 1
-            self.call_service_blocking(self.distance_reset_cli, "teach/set_dist", req)
+            # We're inside an async action callback dispatched by the executor,
+            # so spin_until_future_complete is illegal (Kilted's executor refuses
+            # reentrant spinning). Await the future instead — this yields to the
+            # executor until the service response arrives.
+            future = self.distance_reset_cli.call_async(req)
+            await future
+            if future.result() is None:
+                self.get_logger().error("teach/set_dist call failed")
+                result.success = False
+                goal_handle.abort()
+                return result
 
             self.mapStep = goal.map_step
             if self.mapStep <= 0.0:
