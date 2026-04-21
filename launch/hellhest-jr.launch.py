@@ -29,7 +29,7 @@ def generate_launch_description():
 
     odom_topic = DeclareLaunchArgument(
         "odom_topic",
-        default_value="/odom",
+        default_value="/odom_2d",
         description="nav_msgs/Odometry for distance fusion (sensors node)",
     )
 
