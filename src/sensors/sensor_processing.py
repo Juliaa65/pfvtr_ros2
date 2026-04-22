@@ -219,8 +219,10 @@ class PF2D(SensorFusion):
             np.ones((3, self.particles_num)).transpose() * np.array((dst, 0, 0))
             + self.rng.normal(loc=(0, 0, 0), scale=var, size=(self.particles_num, 3)))
         # self.particles = self.particles - np.mean(self.particles, axis=-1, keepdims=True)
-        self.map_num = request.map_num
-        self.particles[2] = np.random.randint(low=0, high=self.map_num, size=(self.particles_num,))
+        # Repeats always begin on map index 0; the true map count is learned
+        # from SensorsInput.map_num in _process_abs_alignment (SetDist.map_num
+        # carries the starting *index* for base-class compatibility).
+        self.particles[2] = 0
         self.particle_prob = np.ones(self.particles_num) / self.particles_num
         self.last_image = None
         self._get_coords()
@@ -262,6 +264,9 @@ class PF2D(SensorFusion):
         # Parse all data from the incoming message
         curr_time = _builtin_stamp_to_rclpy_time(msg.header.stamp, self._clock)
         self.header = msg.header
+        # Authoritative map count lives on the live stream; SetDist can't
+        # carry it without colliding with the base class's index semantics.
+        self.map_num = max(1, int(msg.map_num))
         if self.last_time is None:
             self.last_time = curr_time
             return
