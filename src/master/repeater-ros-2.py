@@ -520,7 +520,7 @@ class RepeaterServer(Node):
 
         req = SetDist.Request()
         req.dist = float(goal.start_pos)
-        req.map_num = int(self.map_num)
+        req.map_num = 0
         self.distance_reset_cli.call(req)
 
         self.curr_dist = float(goal.start_pos)
