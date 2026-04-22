@@ -300,7 +300,8 @@ class SensorFusion(ABC):
     def set_distance(self, request: SetDist.Request, response: SetDist.Response):
         self.distance = request.dist
         self.distance_std = 0.0
-        self.map = getattr(request, 'map_num', 0)        if self.abs_dist_est is not None:
+        self.map = getattr(request, 'map_num', 0)
+        if self.abs_dist_est is not None:
             self.abs_dist_est.set_dist(self.distance)
         if self.prob_dist_est is not None:
             self.prob_dist_est.set_dist(self.distance)
