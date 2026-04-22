@@ -9,7 +9,7 @@ class Controller:
         self.uncertainty = 0
         self.useUncertainty = True
         self.turnGain = 1.0  #turn 0.1 rad per each pixel of error
-        self.velocityGain = 1 # 1 is same speed as thought map, less is slower more is faster
+        self.velocityGain = 1.0 # 1 is same speed as thought map, less is slower more is faster
 
     def process(self, msg):
         correction = self.alignment * self.turnGain # angle = px * angle/pixel
@@ -21,7 +21,7 @@ class Controller:
         out.linear.z = msg.linear.z * self.velocityGain
         out.angular.x = msg.angular.x * self.turnGain 
         out.angular.y = msg.angular.y * self.turnGain
-        out.angular.z = msg.angular.z + correction
+        out.angular.z = (msg.angular.z * self.velocityGain) + correction
         return out
 
     def reconfig(self,cfg):
