@@ -79,12 +79,18 @@ class SensorProcessingNode(Node):
             raise Exception("Invalid matching scheme - edit launch file!")
 
         align_rel = CrossCorrelation(padding=PAD, network_division=NETWORK_DIVISION, resize_w=RESIZE_W, logger=self.get_logger())
-        dist_abs = OdometryAbsolute(logger=self.get_logger())
+        # Separate OdometryAbsolute per fusion: both teach and repeat subscribe
+        # to the odometry topic, and `process_abs_distance` only short-circuits
+        # while `self.distance is None`. After a teach run, teach_fusion.distance
+        # is set, so during repeat both callbacks fire and a shared accumulator
+        # would be incremented twice per message.
+        teach_dist_abs = OdometryAbsolute(logger=self.get_logger())
+        repeat_dist_abs = OdometryAbsolute(logger=self.get_logger())
         dist_rel = OdometryRelative(logger=self.get_logger())
 
 
         # BearnavClassic is currently only supported
-        self.teach_fusion = BearnavClassic(self, "teach", align_abs, dist_abs, align_abs, align_abs)
+        self.teach_fusion = BearnavClassic(self, "teach", align_abs, teach_dist_abs, align_abs, align_abs)
         self._start_subscribes(
             fusion=self.teach_fusion,
             abs_align_topic="",
@@ -125,7 +131,7 @@ class SensorProcessingNode(Node):
                 node=self,
                 type_prefix="repeat",
                 abs_align_est=align_abs,
-                abs_dist_est=dist_abs,
+                abs_dist_est=repeat_dist_abs,
                 rel_align_est=align_abs,
                 repr_creator=align_abs
             )
