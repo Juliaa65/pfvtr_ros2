@@ -14,7 +14,7 @@ def generate_launch_description():
 
     cmd_vel_teleop_output = DeclareLaunchArgument(
         "cmd_vel_teleop_output",
-        default_value="/cmd_vel_publisher",
+        default_value="/cmd_vel_subscriber",
         description="Topic where simulator publishes teleop commands (for recording)",
     )
 
