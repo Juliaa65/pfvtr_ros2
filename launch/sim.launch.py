@@ -12,6 +12,16 @@ def generate_launch_description():
         description="Camera topic name",
     )
 
+    camera_back_topic = DeclareLaunchArgument(
+        "camera_back_topic",
+        default_value="",
+        description=(
+            "Rear-facing camera topic used when the MapMaker action is "
+            "called with record_backward=true. Empty (the default) disables "
+            "backward mapping — such goals will be rejected with an error."
+        ),
+    )
+
     cmd_vel_teleop_output = DeclareLaunchArgument(
         "cmd_vel_teleop_output",
         default_value="/cmd_vel_publisher",
@@ -107,6 +117,7 @@ def generate_launch_description():
                 respawn=True,
                 parameters=[{
                     "camera_topic": lc("camera_topic"),
+                    "camera_back_topic": lc("camera_back_topic"),
                     "cmd_vel_topic": lc("cmd_vel_teleop_output"),
                     "odom_record_topic": lc("odom_record_topic"),
                 }]
@@ -127,6 +138,7 @@ def generate_launch_description():
 
     return LaunchDescription([
         camera_topic,
+        camera_back_topic,
         cmd_vel_teleop_output,
         cmd_vel_robot_input,
         odom_topic,

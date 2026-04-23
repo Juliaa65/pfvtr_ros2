@@ -15,6 +15,16 @@ def generate_launch_description():
         description="sensor_msgs/Image topic from the simulator",
     )
 
+    camera_back_topic = DeclareLaunchArgument(
+        "camera_back_topic",
+        default_value="",
+        description=(
+            "Rear-facing camera topic used when the MapMaker action is "
+            "called with record_backward=true. Empty (the default) disables "
+            "backward mapping — such goals will be rejected with an error."
+        ),
+    )
+
     cmd_vel_pub = DeclareLaunchArgument(
         "cmd_vel_pub",
         default_value="/cmd_vel",
@@ -99,6 +109,7 @@ def generate_launch_description():
                 respawn=True,
                 parameters=[{
                     "camera_topic": lc("camera_topic"),
+                    "camera_back_topic": lc("camera_back_topic"),
                     "cmd_vel_topic": lc("cmd_vel_sub"),
                     "additional_record_topics": lc("additional_record_topics"),
                 }],
@@ -130,6 +141,7 @@ def generate_launch_description():
 
     return LaunchDescription([
         camera_topic,
+        camera_back_topic,
         cmd_vel_pub,
         cmd_vel_sub,
         odom_topic,

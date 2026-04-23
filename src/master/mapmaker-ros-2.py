@@ -12,7 +12,7 @@ import cv2
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionServer, GoalResponse, CancelResponse
-from rclpy.serialization import serialize_message
+from rclpy.serialization import serialize_message, deserialize_message
 from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
@@ -28,7 +28,7 @@ import rosbag2_py
 
 from pfvtr.action import MapMaker
 from pfvtr.msg import SensorsOutput, SensorsInput, DistancedTwist, Features, FeaturesList
-from pfvtr.srv import SetDist, Alignment
+from pfvtr.srv import SetDist, Alignment, SetCameraTopic
 
 NAVIGATION_QOS = QoSProfile(
     depth=1,
@@ -142,11 +142,23 @@ class MapmakerServer(Node):
         self.declare_parameter("cmd_vel_topic", "/bluetooth_teleop/cmd_vel")
         self.declare_parameter("odom_record_topic", "/odometry_publisher")
         self.declare_parameter("camera_topic", "/camera_front_publisher")
+        # Empty string means "no rear camera configured" — backward mapping
+        # requests will be rejected in that case.
+        self.declare_parameter("camera_back_topic", "")
 
         self.joy_topic = self.get_parameter("cmd_vel_topic").value
         self.cmd_vel_topic = self.get_parameter("cmd_vel_topic").value
         self.odom_record_topic = self.get_parameter("odom_record_topic").value
         self.camera_topic = self.get_parameter("camera_topic").value
+        self.camera_back_topic = (
+            self.get_parameter("camera_back_topic").value or ""
+        ).strip()
+        self._default_camera_topic = self.camera_topic
+        self._active_camera_topic = self.camera_topic
+
+        self._backward_record = False
+        self._active_map_dir = ""
+        self._teach_msg_filter_subs = []
 
 
         self.get_logger().info("Waiting for services to become available...")
@@ -179,6 +191,11 @@ class MapmakerServer(Node):
             while not self.local_align_cli.wait_for_service(timeout_sec=1.0):
                 self.get_logger().info("Waiting for teach/local_alignment...")
             self.get_logger().warn("Local alignment service available for mapmaker")
+
+        # Client for representations' camera rebind service. Best-effort —
+        # the mapmaker should still come up if representations isn't ready
+        # yet, and we can always call the service lazily on action start.
+        self.set_camera_cli = self.create_client(SetCameraTopic, "set_camera_topic")
 
         self.get_logger().debug("Subscribing to commands")
         self.joy_sub = self.create_subscription(TwistStamped, self.joy_topic, self.joy_cb, NAVIGATION_QOS)
@@ -270,10 +287,25 @@ class MapmakerServer(Node):
             self.align_future = self.local_align_cli.call_async(req)
             self.align_in_progress = True
 
+    def _teardown_teach_sync(self):
+        # message_filters.Subscriber holds an rclpy Subscription in `.sub`.
+        # Destroy each so the topic binding is released before we rebuild.
+        for mf_sub in self._teach_msg_filter_subs:
+            inner = getattr(mf_sub, "sub", None)
+            if inner is not None:
+                try:
+                    self.destroy_subscription(inner)
+                except Exception:
+                    pass
+        self._teach_msg_filter_subs = []
+        self.synced_topics = None
+
     def _setup_teach_sync(self):
         repr_sub = Subscriber(self, FeaturesList, "live_representation", qos_profile=SYNC_QOS)
         cam_sub = Subscriber(self, Image, self.camera_topic, qos_profile=SYNC_QOS)
         distance_sub = Subscriber(self, SensorsOutput, "teach/output_dist", qos_profile=SYNC_QOS)
+
+        self._teach_msg_filter_subs = [repr_sub, cam_sub, distance_sub]
 
         self.synced_topics = ApproximateTimeSynchronizer(
             [repr_sub, distance_sub, cam_sub],
@@ -281,6 +313,33 @@ class MapmakerServer(Node):
             slop=0.3
         )
         self.synced_topics.registerCallback(self.distance_img_cb)
+
+    async def _request_representations_camera(self, topic: str) -> bool:
+        if not self.set_camera_cli.wait_for_service(timeout_sec=2.0):
+            self.get_logger().warn(
+                "set_camera_topic service not available — representations may not rebind"
+            )
+            return False
+        req = SetCameraTopic.Request()
+        req.topic = topic
+        future = self.set_camera_cli.call_async(req)
+        await future
+        resp = future.result()
+        if resp is None:
+            self.get_logger().warn("set_camera_topic call returned no response")
+            return False
+        return bool(resp.success)
+
+    async def _rebind_camera(self, topic: str):
+        """Switch both representations' and mapmaker's camera subscription."""
+        if topic == self._active_camera_topic:
+            return
+        await self._request_representations_camera(topic)
+        self.camera_topic = topic
+        self._teardown_teach_sync()
+        self._setup_teach_sync()
+        self._active_camera_topic = topic
+        self.get_logger().warn(f"Mapmaker camera rebound to '{topic}'")
 
     def _setup_repeat_sync(self):
         repr_sub = Subscriber(self, FeaturesList, "live_representation", qos_profile=SYNC_QOS)
@@ -438,6 +497,131 @@ class MapmakerServer(Node):
         self._bag_writer = None
         self._bag_open = False
 
+    def _postprocess_reverse_map(self, map_dir: str):
+        """Rename waypoints and rewrite action bag for a map recorded backward.
+
+        After this runs, filename 0 corresponds to the *end* of the recorded
+        drive (point B) and filename max_dist corresponds to the start (A).
+        The action bag is rewritten with distances rebased and angular.z
+        negated, so forward replay with the front camera retraces the path
+        from B back to A after a physical 180° turn.
+        """
+        self.get_logger().warn(f"Post-processing reverse map at {map_dir}")
+
+        try:
+            distances = get_map_dists(map_dir).tolist()
+        except Exception as e:
+            self.get_logger().warn(f"No .npy files found; skipping reversal: {e}")
+            return
+        if not distances:
+            return
+        max_dist = float(distances[-1])
+        if max_dist <= 0.0:
+            self.get_logger().warn(
+                f"Non-positive max_dist ({max_dist}); skipping reversal"
+            )
+            return
+
+        # Two-phase rename avoids collisions when new distance equals an
+        # existing old distance (e.g. symmetric midpoints).
+        tmp_suffix = ".revtmp"
+        for d in distances:
+            for ext in (".npy", ".jpg"):
+                old = os.path.join(map_dir, f"{d}{ext}")
+                if os.path.exists(old):
+                    os.rename(old, old + tmp_suffix)
+        for d in distances:
+            new_d = max_dist - float(d)
+            for ext in (".npy", ".jpg"):
+                tmp_path = os.path.join(map_dir, f"{d}{ext}{tmp_suffix}")
+                if os.path.exists(tmp_path):
+                    os.rename(tmp_path, os.path.join(map_dir, f"{new_d}{ext}"))
+
+        bag_dir = os.path.join(map_dir, "bag")
+        if os.path.isdir(bag_dir):
+            self._rewrite_bag_reversed(bag_dir, max_dist)
+        else:
+            self.get_logger().warn(f"No bag at {bag_dir}; skipping bag reversal")
+
+        try:
+            with open(os.path.join(map_dir, "params"), "a") as f:
+                f.write("recordedDirection: backward\n")
+        except Exception as e:
+            self.get_logger().warn(f"Could not append direction to params: {e}")
+
+    def _rewrite_bag_reversed(self, bag_dir: str, max_dist: float):
+        converter_options = rosbag2_py.ConverterOptions(
+            input_serialization_format="cdr",
+            output_serialization_format="cdr",
+        )
+
+        reader = rosbag2_py.SequentialReader()
+        reader.open(
+            rosbag2_py.StorageOptions(uri=bag_dir, storage_id="mcap"),
+            converter_options,
+        )
+        topics_info = reader.get_all_topics_and_types()
+        type_by_name = {t.name: t.type for t in topics_info}
+
+        messages = []  # (orig_ns, topic, data)
+        while reader.has_next():
+            topic, data, t_ns = reader.read_next()
+            messages.append((t_ns, topic, data))
+        del reader  # SequentialReader closes on destruction
+
+        # Reverse chronological order so distance runs ascending after
+        # transformation, then transform DistancedTwist payloads in place.
+        messages.sort(key=lambda x: x[0])
+        messages.reverse()
+
+        transformed = []
+        for (_t_ns, topic, data) in messages:
+            if topic == "/recorded_actions":
+                try:
+                    msg = deserialize_message(data, DistancedTwist)
+                    msg.distance = float(max_dist) - float(msg.distance)
+                    msg.twist.angular.z = float(-msg.twist.angular.z)
+                    # linear.x is intentionally left untouched — it was
+                    # positive during forward teach and must remain positive
+                    # for the forward repeat after the robot turns around.
+                    data = serialize_message(msg)
+                except Exception as e:
+                    self.get_logger().warn(
+                        f"Failed to transform /recorded_actions entry: {e}"
+                    )
+            transformed.append((topic, data))
+
+        tmp_dir = bag_dir + ".rev"
+        if os.path.exists(tmp_dir):
+            shutil.rmtree(tmp_dir)
+
+        writer = rosbag2_py.SequentialWriter()
+        writer.open(
+            rosbag2_py.StorageOptions(uri=tmp_dir, storage_id="mcap"),
+            converter_options,
+        )
+        for name, typ in type_by_name.items():
+            writer.create_topic(rosbag2_py.TopicMetadata(
+                id=0,
+                name=name,
+                type=typ,
+                serialization_format="cdr",
+            ))
+
+        # Monotonically-increasing synthetic timestamps; the repeater's
+        # action-replay path matches by `msg.distance`, not by bag stamp,
+        # so exact original timing isn't required.
+        base_ns = self.get_clock().now().nanoseconds
+        step_ns = 1_000_000  # 1 ms
+        for i, (topic, data) in enumerate(transformed):
+            writer.write(topic, data, base_ns + i * step_ns)
+
+        del writer
+
+        shutil.rmtree(bag_dir)
+        os.rename(tmp_dir, bag_dir)
+        self.get_logger().warn(f"Reversed bag written to {bag_dir}")
+
     async def action_cb(self, goal_handle):
         self._active_goal_handle = goal_handle
         goal = goal_handle.request
@@ -465,6 +649,31 @@ class MapmakerServer(Node):
             self.img_msg = None
             self.last_img_msg = None
 
+            self._backward_record = bool(goal.record_backward)
+
+            # Backward mapping requires a configured rear camera. If the
+            # user requested it without one available, reject the goal
+            # instead of silently falling back to the front camera.
+            if self._backward_record and not self.camera_back_topic:
+                self.get_logger().error(
+                    "record_backward=true but `camera_back_topic` parameter "
+                    "is empty — aborting goal. Set camera_back_topic in the "
+                    "launch file to enable backward mapping."
+                )
+                result.success = False
+                goal_handle.abort()
+                return result
+
+            requested_cam = (
+                self.camera_back_topic
+                if self._backward_record
+                else self._default_camera_topic
+            )
+            # Rebind before isMapping flips so the sync stream is already on
+            # the right topic by the time frames start flowing in.
+            await self._rebind_camera(requested_cam)
+            self._active_map_dir = goal.map_name
+
             req = SetDist.Request()
             req.dist = 0.0
             req.map_num = 1
@@ -491,6 +700,7 @@ class MapmakerServer(Node):
                     f.write(f"stepSize: {self.mapStep}\n")
                     f.write(f"cmdVelTopic: {self.cmd_vel_topic}\n")
                     f.write(f"odomTopic: {self.odom_record_topic}\n")
+                    f.write(f"cameraTopic: {self._active_camera_topic}\n")
             except Exception as e:
                 self.get_logger().warn(f"Unable to create map directory, ignoring: {e}")
                 result.success = False
@@ -534,8 +744,6 @@ class MapmakerServer(Node):
             # Block until every queued waypoint is flushed to disk before
             # we return success, so the map directory is complete.
             self._save_queue.join()
-            result.success = True
-            goal_handle.succeed()
 
             self._bag_close()
 
@@ -550,6 +758,22 @@ class MapmakerServer(Node):
                 except Exception as e:
                     self.get_logger().warn(f"Failed to copy bag2 from source map: {e}")
 
+            # Reverse the map if it was recorded with the backward-facing
+            # camera. Bag and .npy/.jpg files must be closed first.
+            if self._backward_record and self._active_map_dir:
+                try:
+                    self._postprocess_reverse_map(self._active_map_dir)
+                except Exception as e:
+                    self.get_logger().error(f"Reverse post-processing failed: {e}")
+            self._backward_record = False
+
+            # Restore the default camera for the next session (repeat or
+            # a subsequent forward teach).
+            if self._active_camera_topic != self._default_camera_topic:
+                await self._rebind_camera(self._default_camera_topic)
+
+            result.success = True
+            goal_handle.succeed()
             return result
 
     def checkShutdown(self):

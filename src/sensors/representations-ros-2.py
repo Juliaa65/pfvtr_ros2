@@ -13,6 +13,7 @@ from cv_bridge import CvBridge
 import cv2
 
 from pfvtr.msg import FeaturesList, ImageList, Features, SensorsInput, Histogram
+from pfvtr.srv import SetCameraTopic
 from backends.siamese.siamese import SiameseCNN
 from backends.siamese.siamfeature import SiamFeature
 
@@ -98,13 +99,11 @@ class RepresentationMatching(Node):
         self.pub = self.create_publisher(FeaturesList, "live_representation", SYNC_FEEDER_QOS)
         self.pub_match = self.create_publisher(SensorsInput, "matched_repr", NAVIGATION_QOS)
 
-        self.sub = self.create_subscription(
-            Image,
-            camera_topic,
-            self.image_parserCB,
-            NAVIGATION_QOS,
-            callback_group=get_exclusive_callback_group()
-        )
+        self._default_camera_topic = camera_topic
+        self._camera_cb_group = get_exclusive_callback_group()
+        self.sub = None
+        self._active_camera_topic = ""
+        self._rebind_camera(camera_topic)
 
         self.map_sub = self.create_subscription(
             SensorsInput,
@@ -113,6 +112,36 @@ class RepresentationMatching(Node):
             NAVIGATION_QOS,
             callback_group=get_exclusive_callback_group()
         )
+
+        self.create_service(
+            SetCameraTopic,
+            "set_camera_topic",
+            self._on_set_camera_topic,
+        )
+
+    def _rebind_camera(self, topic: str) -> bool:
+        topic = topic.strip() if topic else ""
+        if not topic:
+            topic = self._default_camera_topic
+        if topic == self._active_camera_topic and self.sub is not None:
+            return True
+        if self.sub is not None:
+            self.destroy_subscription(self.sub)
+            self.sub = None
+        self.sub = self.create_subscription(
+            Image,
+            topic,
+            self.image_parserCB,
+            NAVIGATION_QOS,
+            callback_group=self._camera_cb_group,
+        )
+        self._active_camera_topic = topic
+        self.get_logger().warn(f"Camera subscription bound to '{topic}'")
+        return True
+
+    def _on_set_camera_topic(self, request: SetCameraTopic.Request, response: SetCameraTopic.Response):
+        response.success = self._rebind_camera(request.topic)
+        return response
 
     def parse_camera_msg(self, msg: Image):
         try:

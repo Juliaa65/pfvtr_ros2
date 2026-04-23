@@ -49,22 +49,31 @@ class VTRControlGUI(Node):
         
         # Save images checkbox
         self.save_imgs_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(mapping_frame, text="Save Images for Visualization", 
+        ttk.Checkbutton(mapping_frame, text="Save Images for Visualization",
                        variable=self.save_imgs_var).grid(row=1, column=0, columnspan=2, sticky='w', pady=2)
-        
+
         # Map step
         ttk.Label(mapping_frame, text="Map Step (m):").grid(row=2, column=0, sticky='w', pady=2)
         self.map_step_var = tk.StringVar(value="1.0")
         ttk.Entry(mapping_frame, textvariable=self.map_step_var, width=10).grid(row=2, column=1, sticky='w', pady=2)
-        
+
         # Source map
         ttk.Label(mapping_frame, text="Source Map:").grid(row=3, column=0, sticky='w', pady=2)
         self.source_map_var = tk.StringVar(value="")
         ttk.Entry(mapping_frame, textvariable=self.source_map_var, width=30).grid(row=3, column=1, pady=2)
-        
+
+        # Record backward: uses the rear camera configured via the
+        # `camera_back_topic` launch argument; the mapmaker post-processes
+        # the finished map so it can be repeated forward with the front
+        # camera after a 180° turn. Goal is rejected if no rear camera is
+        # configured.
+        self.record_backward_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(mapping_frame, text="Record Backward (rear camera)",
+                       variable=self.record_backward_var).grid(row=4, column=0, columnspan=2, sticky='w', pady=2)
+
         # Buttons
         button_frame = ttk.Frame(mapping_frame)
-        button_frame.grid(row=4, column=0, columnspan=2, pady=10)
+        button_frame.grid(row=5, column=0, columnspan=2, pady=10)
         
         self.start_mapping_btn = ttk.Button(button_frame, text="START MAPPING", 
                                             command=lambda: self.send_mapping_goal(start=True))
@@ -219,6 +228,7 @@ class VTRControlGUI(Node):
         except ValueError:
             goal.map_step = 1.0
         goal.source_map = self.source_map_var.get()
+        goal.record_backward = self.record_backward_var.get()
         
         action_text = "START" if start else "STOP"
         self.log_status(f"Sending {action_text} MAPPING goal...")

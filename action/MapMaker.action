@@ -4,6 +4,8 @@ string map_name
 bool start
 float32 map_step
 string source_map
+bool record_backward       # true = record with launch-configured rear camera and
+                           #        post-process the map into reversed form
 ---
 #result definition
 bool success

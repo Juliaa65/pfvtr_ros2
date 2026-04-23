@@ -32,6 +32,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/SetClockGain.srv"
   "srv/Representations.srv"
   "srv/StopRepeater.srv"
+  "srv/SetCameraTopic.srv"
 
   # Actions
   "action/MapMaker.action"
