@@ -56,6 +56,7 @@ def generate_launch_description():
 
     choice_beta = DeclareLaunchArgument("choice_beta", default_value="2.5")
     matching_type = DeclareLaunchArgument("matching_type", default_value="siam")
+    turn_gain = DeclareLaunchArgument("turn_gain", default_value="0.05")
 
 
     lc = LaunchConfiguration
@@ -106,6 +107,7 @@ def generate_launch_description():
                 respawn=True,
                 parameters=[{
                     "cmd_vel_topic": lc("cmd_vel_robot_input"),
+                    "turn_gain": lc("turn_gain"),
                 }],
             ),
 
@@ -152,5 +154,6 @@ def generate_launch_description():
         model_path,
         choice_beta,
         matching_type,
+        turn_gain,
         pfvtr_group,
     ])
