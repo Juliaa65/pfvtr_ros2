@@ -44,11 +44,22 @@ class ControllerNode(Node):
 
         self.add_on_set_parameters_callback(self.callbackReconfigure)
 
-    def _apply_controller_params(self):
+    def _apply_controller_params(self, overrides=None):
+        # `add_on_set_parameters_callback` is a *pre-set* callback: when it
+        # fires, the new values are still in the `params` list and have not
+        # yet been written to the parameter store. Reading via
+        # `self.get_parameter(...)` here would return the previous value, so
+        # the user would have to click Apply twice for a change to land.
+        # Callers from the param callback pass `overrides={name: new_value}`
+        # to bypass that race; the __init__ caller passes nothing.
+        overrides = overrides or {}
 
-        velocity_gain = float(self.get_parameter("velocity_gain").value)
-        turn_gain = float(self.get_parameter("turn_gain").value)
-        use_uncertainty = bool(self.get_parameter("use_uncertainty").value)
+        velocity_gain = float(overrides.get(
+            "velocity_gain", self.get_parameter("velocity_gain").value))
+        turn_gain = float(overrides.get(
+            "turn_gain", self.get_parameter("turn_gain").value))
+        use_uncertainty = bool(overrides.get(
+            "use_uncertainty", self.get_parameter("use_uncertainty").value))
 
         if hasattr(self.c, "reconfig"):
             self.c.reconfig({
@@ -78,13 +89,16 @@ class ControllerNode(Node):
         self.c.correction(msg)
 
     def callbackReconfigure(self, params):
+        overrides = {}
         for p in params:
-            if p.name in ("velocity_gain", "turn_gain", "use_uncertainty"):
-                continue
             if p.name == "cmd_vel_topic":
                 return SetParametersResult(successful=False, reason="cmd_vel_topic cannot be changed at runtime")
+            if p.name in ("velocity_gain", "turn_gain"):
+                overrides[p.name] = float(p.value)
+            elif p.name == "use_uncertainty":
+                overrides[p.name] = bool(p.value)
 
-        self._apply_controller_params()
+        self._apply_controller_params(overrides=overrides)
         return SetParametersResult(successful=True)
 
     def _set_clock_gain_from_velocity(self, velocity_gain: float):

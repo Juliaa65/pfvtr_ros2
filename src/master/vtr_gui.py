@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import math
 import tkinter as tk
 from tkinter import ttk, messagebox
 import os
@@ -11,6 +12,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from nav_msgs.msg import Odometry
 from rcl_interfaces.srv import SetParameters
 from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
+from geometry_msgs.msg import PoseWithCovarianceStamped
 from pfvtr.action import MapMaker, MapRepeater
 from pfvtr.msg import FeaturesList
 
@@ -33,6 +35,17 @@ class VTRControlGUI(Node):
         self.controller_param_client = self.create_client(
             SetParameters, '/pfvtr/controller/set_parameters'
         )
+        # /initialpose is the rviz "2D Pose Estimate" topic.  The voxels
+        # simulator subscribes to it and teleports the robot to the given
+        # x, y, yaw (yaw extracted from the quaternion).
+        teleport_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self.teleport_pub = self.create_publisher(
+            PoseWithCovarianceStamped, '/initialpose', teleport_qos
+        )
 
         self.mapping_goal_handle = None
         self.repeating_goal_handle = None
@@ -40,7 +53,7 @@ class VTRControlGUI(Node):
 
         self.root = tk.Tk()
         self.root.title("VT&R Control Panel")
-        self.root.geometry("500x720")
+        self.root.geometry("520x780")
 
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill='both', expand=True, padx=5, pady=5)
@@ -228,6 +241,70 @@ class VTRControlGUI(Node):
         self.control_status_var = tk.StringVar(value="")
         ttk.Label(controller_frame, textvariable=self.control_status_var,
                   foreground="blue").grid(row=3, column=0, columnspan=3, sticky='w', pady=(4, 0))
+
+        teleport_frame = ttk.LabelFrame(parent, text="Robot Teleport (voxels sim)", padding=10)
+        teleport_frame.pack(fill='x', padx=10, pady=5)
+
+        ttk.Label(teleport_frame, text="X [m]:").grid(row=0, column=0, sticky='w', pady=4)
+        self.teleport_x_var = tk.StringVar(value="0.0")
+        ttk.Entry(teleport_frame, textvariable=self.teleport_x_var, width=10).grid(
+            row=0, column=1, sticky='w', pady=4, padx=5
+        )
+
+        ttk.Label(teleport_frame, text="Y [m]:").grid(row=1, column=0, sticky='w', pady=4)
+        self.teleport_y_var = tk.StringVar(value="0.0")
+        ttk.Entry(teleport_frame, textvariable=self.teleport_y_var, width=10).grid(
+            row=1, column=1, sticky='w', pady=4, padx=5
+        )
+
+        ttk.Label(teleport_frame, text="Yaw [deg]:").grid(row=2, column=0, sticky='w', pady=4)
+        self.teleport_yaw_var = tk.StringVar(value="0.0")
+        ttk.Entry(teleport_frame, textvariable=self.teleport_yaw_var, width=10).grid(
+            row=2, column=1, sticky='w', pady=4, padx=5
+        )
+
+        ttk.Button(teleport_frame, text="Teleport", command=self._send_teleport).grid(
+            row=3, column=0, columnspan=2, sticky='w', pady=(8, 0)
+        )
+
+        ttk.Label(
+            teleport_frame,
+            text="Publishes PoseWithCovarianceStamped on /initialpose (rviz convention).",
+            foreground="gray",
+        ).grid(row=4, column=0, columnspan=2, sticky='w', pady=(4, 0))
+
+        self.teleport_status_var = tk.StringVar(value="")
+        ttk.Label(teleport_frame, textvariable=self.teleport_status_var,
+                  foreground="blue").grid(row=5, column=0, columnspan=2, sticky='w', pady=(4, 0))
+
+    def _send_teleport(self):
+        try:
+            x = float(self.teleport_x_var.get())
+            y = float(self.teleport_y_var.get())
+            yaw_deg = float(self.teleport_yaw_var.get())
+        except ValueError:
+            msg = "ERROR: X, Y, and Yaw must be numeric"
+            self.log_status(msg)
+            self.teleport_status_var.set(msg)
+            return
+
+        yaw_rad = math.radians(yaw_deg)
+        msg = PoseWithCovarianceStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "map"
+        msg.pose.pose.position.x = x
+        msg.pose.pose.position.y = y
+        msg.pose.pose.position.z = 0.0
+        # Yaw-only rotation about +Z (ROS REP-103).
+        msg.pose.pose.orientation.x = 0.0
+        msg.pose.pose.orientation.y = 0.0
+        msg.pose.pose.orientation.z = math.sin(yaw_rad / 2.0)
+        msg.pose.pose.orientation.w = math.cos(yaw_rad / 2.0)
+        self.teleport_pub.publish(msg)
+
+        out = f"Teleport published: x={x} y={y} yaw={yaw_deg} deg"
+        self.log_status(out)
+        self.teleport_status_var.set(out)
 
     def _apply_controller_param(self, name, raw_value):
         try:
