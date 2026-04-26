@@ -5,10 +5,21 @@ from tkinter import ttk, messagebox
 import os
 import glob
 
+# All maps live under this workspace-relative directory.  Resolution happens
+# here; on-the-wire `map_name` (in actions and inside `params`) stays a bare
+# name.
+MAPS_DIR = "maps"
+
+
+def _map_path(name, *parts):
+    return os.path.join(MAPS_DIR, name, *parts)
+
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+from rclpy.serialization import deserialize_message
+import rosbag2_py
 from nav_msgs.msg import Odometry
 from rcl_interfaces.srv import SetParameters, GetParameters
 from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
@@ -56,7 +67,7 @@ class VTRControlGUI(Node):
 
         self.root = tk.Tk()
         self.root.title("VT&R Control Panel")
-        self.root.geometry("520x920")
+        self.root.geometry("620x920")
 
         # Buttons that depend on the rest of the stack being up.  Created
         # disabled, flipped to normal by `_check_stack_ready()` once the
@@ -165,13 +176,20 @@ class VTRControlGUI(Node):
         map_select_frame.grid(row=0, column=1, sticky='w', pady=2)
         
         self.repeat_map_name_var = tk.StringVar()
-        self.map_combobox = ttk.Combobox(map_select_frame, textvariable=self.repeat_map_name_var, 
+        self.map_combobox = ttk.Combobox(map_select_frame, textvariable=self.repeat_map_name_var,
                                          width=22, state='readonly')
         self.map_combobox.pack(side='left')
-        
+
         refresh_btn = ttk.Button(map_select_frame, text="Refresh", width=8,
                                 command=self.refresh_maps_list)
         refresh_btn.pack(side='left', padx=5)
+
+        self.teleport_to_map_btn = ttk.Button(
+            map_select_frame, text="Teleport", width=10,
+            command=self._teleport_to_map_start, state='disabled',
+        )
+        self.teleport_to_map_btn.pack(side='left', padx=5)
+        self._gated_widgets.append(self.teleport_to_map_btn)
         
         # Start position
         ttk.Label(repeating_frame, text="Start Position:").grid(row=1, column=0, sticky='w', pady=2)
@@ -212,12 +230,21 @@ class VTRControlGUI(Node):
         ttk.Entry(repeating_frame, textvariable=self.image_pub_var, width=5,
                   state=image_pub_state).grid(row=6, column=1, sticky='w', pady=2)
         
-        # Send button
-        self.send_repeat_btn = ttk.Button(repeating_frame, text="SEND REPEAT COMMAND",
+        # Send / Stop buttons.  STOP is not in `_gated_widgets` because it
+        # has its own state machine driven by goal acceptance / completion,
+        # mirroring how STOP MAPPING is handled.
+        repeat_btn_frame = ttk.Frame(repeating_frame)
+        repeat_btn_frame.grid(row=7, column=0, columnspan=2, pady=10)
+        self.send_repeat_btn = ttk.Button(repeat_btn_frame, text="SEND REPEAT COMMAND",
                                           command=self.send_repeating_goal,
                                           state='disabled')
-        self.send_repeat_btn.grid(row=7, column=0, columnspan=2, pady=10)
+        self.send_repeat_btn.pack(side='left', padx=5)
         self._gated_widgets.append(self.send_repeat_btn)
+
+        self.stop_repeat_btn = ttk.Button(repeat_btn_frame, text="STOP REPEAT",
+                                          command=self.send_stop_repeat,
+                                          state='disabled')
+        self.stop_repeat_btn.pack(side='left', padx=5)
     
     def setup_status_bar(self, parent):
         status_frame = ttk.LabelFrame(parent, text="Status", padding=10)
@@ -503,10 +530,18 @@ class VTRControlGUI(Node):
     
     def refresh_maps_list(self):
         maps = []
-        for item in os.listdir('.'):
-            if os.path.isdir(item) and os.path.exists(os.path.join(item, 'params')):
+        if not os.path.isdir(MAPS_DIR):
+            self.map_combobox['values'] = []
+            self.log_status(
+                f"No '{MAPS_DIR}/' directory yet — record a map to create it."
+            )
+            return
+
+        for item in os.listdir(MAPS_DIR):
+            full = os.path.join(MAPS_DIR, item)
+            if os.path.isdir(full) and os.path.exists(os.path.join(full, 'params')):
                 maps.append(item)
-        
+
         maps.sort()
         self.map_combobox['values'] = maps
         if maps:
@@ -649,21 +684,110 @@ class VTRControlGUI(Node):
             self.log_status("Repeating goal REJECTED")
             self.send_repeat_btn.configure(state='normal')
             return
-        
+
         self.log_status("Repeating goal ACCEPTED - Robot is now navigating...")
         self.repeating_goal_handle = goal_handle
-        
+        self.stop_repeat_btn.configure(state='normal')
+
         result_future = goal_handle.get_result_async()
         result_future.add_done_callback(self.repeating_result_callback)
-    
+
     def repeating_feedback_callback(self, feedback_msg):
         pass
-    
+
     def repeating_result_callback(self, future):
         result = future.result().result
         self.log_status(f"Repeating completed - Success: {result.success}")
         self.send_repeat_btn.configure(state='normal')
+        self.stop_repeat_btn.configure(state='disabled')
         self.repeating_goal_handle = None
+
+    def _teleport_to_map_start(self):
+        # Open the selected map's mcap bag, scan for the first
+        # /recorded_odometry message, and republish its pose on /initialpose.
+        # The voxels simulator's PoseWithCovarianceStamped subscriber picks
+        # this up and teleports the robot.
+        map_name = self.repeat_map_name_var.get()
+        if not map_name:
+            self.log_status("ERROR: select a map first")
+            return
+        bag_dir = _map_path(map_name, "bag")
+        if not os.path.isdir(bag_dir):
+            self.log_status(f"ERROR: bag dir not found: {bag_dir}")
+            return
+
+        try:
+            reader = rosbag2_py.SequentialReader()
+            reader.open(
+                rosbag2_py.StorageOptions(uri=bag_dir, storage_id="mcap"),
+                rosbag2_py.ConverterOptions(
+                    input_serialization_format="cdr",
+                    output_serialization_format="cdr",
+                ),
+            )
+        except Exception as exc:
+            self.log_status(f"ERROR opening bag {bag_dir}: {exc}")
+            return
+
+        odom_msg = None
+        while reader.has_next():
+            topic, raw, _ = reader.read_next()
+            if topic == "/recorded_odometry":
+                odom_msg = deserialize_message(raw, Odometry)
+                break
+
+        if odom_msg is None:
+            self.log_status(f"ERROR: no /recorded_odometry messages in {bag_dir}")
+            return
+
+        # The voxels sim's /recorded_odometry is in raylib axes (Y up),
+        # while the sim's /initialpose subscriber expects ROS REP-103
+        # (Z up).  Translate both position and heading here so the bag's
+        # recorded pose maps to the right teleport destination.
+        rp = odom_msg.pose.pose.position
+        rq = odom_msg.pose.pose.orientation
+
+        # Recover the camera's actual look direction by rotating raylib's
+        # default forward (-Z) with the recorded quaternion, then take the
+        # heading angle in the X-Z floor plane (matches getPlayerAngle's
+        # atan2(z, x) convention).
+        dir_x = -2.0 * (rq.x * rq.z + rq.y * rq.w)
+        dir_z = -(1.0 - 2.0 * (rq.x * rq.x + rq.y * rq.y))
+        heading = math.atan2(dir_z, dir_x)
+
+        msg = PoseWithCovarianceStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "map"
+        # raylib x → ROS x (forward); raylib z (lateral floor) → ROS y;
+        # raylib y is height, dropped (the sim pins height to 0.5 itself).
+        msg.pose.pose.position.x = rp.x
+        msg.pose.pose.position.y = rp.z
+        msg.pose.pose.position.z = 0.0
+        # Re-encode the heading as a +Z-axis quaternion so the simulator's
+        # standard ROS yaw-extraction formula reads it back correctly.
+        msg.pose.pose.orientation.x = 0.0
+        msg.pose.pose.orientation.y = 0.0
+        msg.pose.pose.orientation.z = math.sin(heading / 2.0)
+        msg.pose.pose.orientation.w = math.cos(heading / 2.0)
+        self.teleport_pub.publish(msg)
+
+        self.log_status(
+            f"Teleported to start of '{map_name}': "
+            f"x={rp.x:.2f} y={rp.z:.2f} (raylib z), heading={math.degrees(heading):.1f} deg"
+        )
+
+    def send_stop_repeat(self):
+        # Cancel the in-flight repeat goal via the action's native cancel
+        # path.  The repeater node accepts the cancel in `cancel_cb`, which
+        # flips `is_cancel_requested`; its `checkShutdown` then calls
+        # `goal_handle.canceled()` and tears down the navigation loop.  The
+        # result callback above will then re-enable SEND REPEAT.
+        if self.repeating_goal_handle is None:
+            self.log_status("STOP REPEAT: no active goal to cancel")
+            return
+        self.log_status("Sending cancel to repeater action...")
+        self.stop_repeat_btn.configure(state='disabled')
+        self.repeating_goal_handle.cancel_goal_async()
     
     def spin_ros(self):
         # Drain pending ROS work each tick so high-rate subscriptions aren't

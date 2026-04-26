@@ -37,6 +37,16 @@ def get_exclusive_callback_group():
 
 
 
+# All maps live under a single workspace-relative directory.  Resolution
+# happens here; on-the-wire `map_name` (in actions and inside `params`) stays
+# a bare name.
+MAPS_DIR = "maps"
+
+
+def _map_path(name: str, *parts: str) -> str:
+    return os.path.join(MAPS_DIR, name, *parts)
+
+
 _bridge = CvBridge()
 
 def parse_camera_msg(msg: Image) -> Image:
@@ -55,7 +65,14 @@ def load_map(mappaths, images, distances, trans, times, source_align, logger):
     else:
         mappaths = [mappaths]
 
+    # Keep the bare name (used for cross-map consistency checks via the
+    # source_map_align field that mapmaker writes as a bare name) and the
+    # resolved filesystem path (for actual I/O) side-by-side.
+    map_names = list(mappaths)
+    mappaths = [_map_path(m) for m in map_names]
+
     for map_idx, mappath in enumerate(mappaths):
+        map_name = map_names[map_idx]
         tmp = []
         for file in list(os.listdir(mappath)):
             if file.endswith(".npy"):
@@ -77,7 +94,7 @@ def load_map(mappaths, images, distances, trans, times, source_align, logger):
                 ts = map_point["timestamp"]
                 diff_hist = map_point["diff_hist"]
                 if map_point["source_map_align"] is None:
-                    sm = mappath
+                    sm = map_name
                 else:
                     sm = map_point["source_map_align"][0]
 
@@ -479,7 +496,7 @@ class RepeaterServer(Node):
             return result
 
         map_name = goal.map_name.split(",")[0]
-        self.parseParams(os.path.join(map_name, "params"))
+        self.parseParams(_map_path(map_name, "params"))
 
         self.map_publish_span = int(goal.image_pub)
 
@@ -518,7 +535,7 @@ class RepeaterServer(Node):
         self.use_distances = goal.use_dist
 
 
-        bag_uri = os.path.join(map_name, "bag")
+        bag_uri = _map_path(map_name, "bag")
 
 
         req = SetDist.Request()

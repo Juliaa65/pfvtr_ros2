@@ -46,6 +46,16 @@ SYNC_QOS = QoSProfile(
 TARGET_WIDTH = 512
 
 
+# All maps live under a single workspace-relative directory so they don't
+# clutter the workspace root.  Resolution happens here; on-the-wire `map_name`
+# in actions and on disk inside `params` stays a bare name.
+MAPS_DIR = "maps"
+
+
+def _map_path(name: str, *parts: str) -> str:
+    return os.path.join(MAPS_DIR, name, *parts)
+
+
 def get_map_dists(mappath: str) -> np.ndarray:
     tmp = []
     for file in list(os.listdir(mappath)):
@@ -64,7 +74,7 @@ def numpy_to_feature(array):
 def save_img(img_repr, image_msg: Image, header: Header, map_name: str,
              curr_dist, curr_hist, curr_align, source_map, save_img_flag: bool,
              bridge: CvBridge):
-    filename = str(map_name) + "/" + str(curr_dist)
+    filename = _map_path(map_name, str(curr_dist))
     ts = header.stamp.sec + header.stamp.nanosec / 1e9
 
 
@@ -356,8 +366,13 @@ class MapmakerServer(Node):
 
 
     def misc_cb(self, msg: Odometry):
-        if self.isMapping:
-            self.lastOdom = msg
+        # Always cache the most recent odometry so the action_cb can record
+        # the robot's pose at the *moment the mapping goal arrives*, not at
+        # the first action_dist_step after motion starts.  Dropping the
+        # `isMapping` gate is safe — `lastOdom` is only consumed inside the
+        # twist-callback bag-write path, which itself runs only while a bag
+        # is open.
+        self.lastOdom = msg
 
     def distance_wrapper_cb(self, repr_msg: FeaturesList, dist_msg: SensorsOutput, align_msg: SensorsOutput, img: Image):
         self.curr_alignment = align_msg.output
@@ -461,7 +476,7 @@ class MapmakerServer(Node):
         return CancelResponse.ACCEPT
 
     def _bag_open_for_map(self, map_name: str):
-        bag_dir = os.path.join(map_name, "bag")
+        bag_dir = _map_path(map_name, "bag")
 
         storage_options = rosbag2_py.StorageOptions(
             uri=bag_dir,
@@ -630,7 +645,7 @@ class MapmakerServer(Node):
         if goal.source_map != "":
             self.target_distances = []
             self.source_map = goal.source_map
-            self.target_distances = get_map_dists(self.source_map)
+            self.target_distances = get_map_dists(_map_path(self.source_map))
             self.collected_distances = np.zeros_like(self.target_distances)
             self._setup_repeat_sync()
             self.get_logger().warn(f"mapmaker listening to distance callback of map {goal.source_map}")
@@ -695,8 +710,9 @@ class MapmakerServer(Node):
                 self.mapStep = 1.0
 
             try:
-                os.mkdir(goal.map_name)
-                with open(os.path.join(goal.map_name, "params"), "w") as f:
+                os.makedirs(MAPS_DIR, exist_ok=True)
+                os.mkdir(_map_path(goal.map_name))
+                with open(_map_path(goal.map_name, "params"), "w") as f:
                     f.write(f"stepSize: {self.mapStep}\n")
                     f.write(f"cmdVelTopic: {self.cmd_vel_topic}\n")
                     f.write(f"odomTopic: {self.odom_record_topic}\n")
@@ -709,6 +725,30 @@ class MapmakerServer(Node):
 
             self.get_logger().info("Starting mapping")
             self._bag_open_for_map(goal.map_name)
+
+            # Persist the start pose immediately so the bag's first
+            # /recorded_odometry sample reflects the true beginning of the
+            # trajectory rather than the first sample after motion crossed
+            # action_dist_step.  Best-effort: if no odometry topic was
+            # configured (or no message has arrived yet), skip silently —
+            # this must not abort goal acceptance.
+            if self.lastOdom is not None:
+                try:
+                    now_ns = self.get_clock().now().nanoseconds
+                    self._bag_writer.write(
+                        "/recorded_odometry",
+                        serialize_message(self.lastOdom),
+                        now_ns,
+                    )
+                except Exception as e:
+                    self.get_logger().warn(
+                        f"Could not record start pose to /recorded_odometry: {e}"
+                    )
+            else:
+                self.get_logger().info(
+                    "No odometry sample cached at mapping start — "
+                    "/recorded_odometry will start at the first motion step"
+                )
 
             self.mapName = goal.map_name
             self.nextStep = 0.0
@@ -737,7 +777,7 @@ class MapmakerServer(Node):
                 f"STOP STATE | header={self.header is not None} | img={self.img_msg is not None} | feat={self.img_features is not None} | dist={self.dist}"
             )
             self.get_logger().warn("Stopping Mapping")
-            self.get_logger().info(f"Map saved under: '{os.path.abspath(self.mapName)}'")
+            self.get_logger().info(f"Map saved under: '{os.path.abspath(_map_path(self.mapName))}'")
 
             time.sleep(2)
             self.isMapping = False
@@ -749,8 +789,8 @@ class MapmakerServer(Node):
 
             if self.target_distances is not None:
                 self.get_logger().warn("Removing and copying action commands")
-                dst_bag_dir = os.path.join(goal.map_name, "bag")
-                src_bag_dir = os.path.join(goal.source_map, "bag")
+                dst_bag_dir = _map_path(goal.map_name, "bag")
+                src_bag_dir = _map_path(goal.source_map, "bag")
                 try:
                     if os.path.isdir(dst_bag_dir):
                         shutil.rmtree(dst_bag_dir)
@@ -762,7 +802,7 @@ class MapmakerServer(Node):
             # camera. Bag and .npy/.jpg files must be closed first.
             if self._backward_record and self._active_map_dir:
                 try:
-                    self._postprocess_reverse_map(self._active_map_dir)
+                    self._postprocess_reverse_map(_map_path(self._active_map_dir))
                 except Exception as e:
                     self.get_logger().error(f"Reverse post-processing failed: {e}")
             self._backward_record = False
