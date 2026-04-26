@@ -10,7 +10,7 @@ from rclpy.node import Node
 from rclpy.action import ActionClient
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from nav_msgs.msg import Odometry
-from rcl_interfaces.srv import SetParameters
+from rcl_interfaces.srv import SetParameters, GetParameters
 from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from pfvtr.action import MapMaker, MapRepeater
@@ -35,6 +35,9 @@ class VTRControlGUI(Node):
         self.controller_param_client = self.create_client(
             SetParameters, '/pfvtr/controller/set_parameters'
         )
+        self.controller_get_param_client = self.create_client(
+            GetParameters, '/pfvtr/controller/get_parameters'
+        )
         # /initialpose is the rviz "2D Pose Estimate" topic.  The voxels
         # simulator subscribes to it and teleports the robot to the given
         # x, y, yaw (yaw extracted from the quaternion).
@@ -53,7 +56,21 @@ class VTRControlGUI(Node):
 
         self.root = tk.Tk()
         self.root.title("VT&R Control Panel")
-        self.root.geometry("520x780")
+        self.root.geometry("520x920")
+
+        # Buttons that depend on the rest of the stack being up.  Created
+        # disabled, flipped to normal by `_check_stack_ready()` once the
+        # required services / action servers have appeared.  `stop_mapping_btn`
+        # is intentionally NOT gated here: it has its own state machine
+        # driven by goal acceptance.
+        self._gated_widgets = []
+
+        self.readiness_var = tk.StringVar(value="Waiting for stack...")
+        self.readiness_label = tk.Label(
+            self.root, textvariable=self.readiness_var,
+            foreground="orange", anchor='w'
+        )
+        self.readiness_label.pack(fill='x', padx=10, pady=2)
 
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill='both', expand=True, padx=5, pady=5)
@@ -70,6 +87,21 @@ class VTRControlGUI(Node):
         self.setup_control_frame(self.control_tab)
 
         self.refresh_maps_list()
+
+        # Pull current controller gains from the parameter server so the
+        # entries reflect the launch-configured (or live-updated) values
+        # rather than the hardcoded "1.0" placeholders.  Async + retry: if
+        # the controller node isn't up yet we re-arm in 1 s; the GUI never
+        # blocks waiting for it.
+        self.root.after(500, self._fetch_initial_gains)
+
+        # Block any user-triggered ROS calls until the rest of the stack is
+        # initialized.  We wait on the same set/dist services the mapmaker
+        # and repeater nodes already gate on internally, plus the action
+        # servers and the representations / controller services.  This
+        # guarantees that by the time buttons are enabled, every node has
+        # finished __init__ (incl. NN model loading in `representations`).
+        self.root.after(500, self._check_stack_ready)
 
         # Periodic ROS2 spinning
         self.root.after(20, self.spin_ros)
@@ -111,12 +143,14 @@ class VTRControlGUI(Node):
         button_frame = ttk.Frame(mapping_frame)
         button_frame.grid(row=5, column=0, columnspan=2, pady=10)
         
-        self.start_mapping_btn = ttk.Button(button_frame, text="START MAPPING", 
-                                            command=lambda: self.send_mapping_goal(start=True))
+        self.start_mapping_btn = ttk.Button(button_frame, text="START MAPPING",
+                                            command=lambda: self.send_mapping_goal(start=True),
+                                            state='disabled')
         self.start_mapping_btn.pack(side='left', padx=5)
-        
-        self.stop_mapping_btn = ttk.Button(button_frame, text="STOP MAPPING", 
-                                           command=lambda: self.send_mapping_goal(start=False), 
+        self._gated_widgets.append(self.start_mapping_btn)
+
+        self.stop_mapping_btn = ttk.Button(button_frame, text="STOP MAPPING",
+                                           command=lambda: self.send_mapping_goal(start=False),
                                            state='disabled')
         self.stop_mapping_btn.pack(side='left', padx=5)
     
@@ -179,9 +213,11 @@ class VTRControlGUI(Node):
                   state=image_pub_state).grid(row=6, column=1, sticky='w', pady=2)
         
         # Send button
-        self.send_repeat_btn = ttk.Button(repeating_frame, text="SEND REPEAT COMMAND", 
-                                          command=self.send_repeating_goal)
+        self.send_repeat_btn = ttk.Button(repeating_frame, text="SEND REPEAT COMMAND",
+                                          command=self.send_repeating_goal,
+                                          state='disabled')
         self.send_repeat_btn.grid(row=7, column=0, columnspan=2, pady=10)
+        self._gated_widgets.append(self.send_repeat_btn)
     
     def setup_status_bar(self, parent):
         status_frame = ttk.LabelFrame(parent, text="Status", padding=10)
@@ -217,20 +253,26 @@ class VTRControlGUI(Node):
         ttk.Entry(controller_frame, textvariable=self.turn_gain_var, width=10).grid(
             row=0, column=1, sticky='w', pady=4, padx=5
         )
-        ttk.Button(
+        self.turn_gain_btn = ttk.Button(
             controller_frame, text="Apply",
             command=lambda: self._apply_controller_param("turn_gain", self.turn_gain_var.get()),
-        ).grid(row=0, column=2, sticky='w', pady=4)
+            state='disabled',
+        )
+        self.turn_gain_btn.grid(row=0, column=2, sticky='w', pady=4)
+        self._gated_widgets.append(self.turn_gain_btn)
 
         ttk.Label(controller_frame, text="velocity_gain:").grid(row=1, column=0, sticky='w', pady=4)
         self.velocity_gain_var = tk.StringVar(value="1.0")
         ttk.Entry(controller_frame, textvariable=self.velocity_gain_var, width=10).grid(
             row=1, column=1, sticky='w', pady=4, padx=5
         )
-        ttk.Button(
+        self.velocity_gain_btn = ttk.Button(
             controller_frame, text="Apply",
             command=lambda: self._apply_controller_param("velocity_gain", self.velocity_gain_var.get()),
-        ).grid(row=1, column=2, sticky='w', pady=4)
+            state='disabled',
+        )
+        self.velocity_gain_btn.grid(row=1, column=2, sticky='w', pady=4)
+        self._gated_widgets.append(self.velocity_gain_btn)
 
         ttk.Label(
             controller_frame,
@@ -263,9 +305,12 @@ class VTRControlGUI(Node):
             row=2, column=1, sticky='w', pady=4, padx=5
         )
 
-        ttk.Button(teleport_frame, text="Teleport", command=self._send_teleport).grid(
-            row=3, column=0, columnspan=2, sticky='w', pady=(8, 0)
+        self.teleport_btn = ttk.Button(
+            teleport_frame, text="Teleport",
+            command=self._send_teleport, state='disabled',
         )
+        self.teleport_btn.grid(row=3, column=0, columnspan=2, sticky='w', pady=(8, 0))
+        self._gated_widgets.append(self.teleport_btn)
 
         ttk.Label(
             teleport_frame,
@@ -333,6 +378,66 @@ class VTRControlGUI(Node):
         future.add_done_callback(
             lambda fut, n=name, v=value: self._param_set_done(fut, n, v)
         )
+
+    def _check_stack_ready(self):
+        # The mapmaker and repeater nodes wait for these `set_dist` services
+        # at their own startup (see mapmaker-ros-2.py:170 and
+        # repeater-ros-2.py:157), so reusing them as the GUI's readiness
+        # signal matches the stack's existing internal contract.
+        # `set_camera_topic` is the only service the representations node
+        # advertises and it's created at the end of __init__, so it works
+        # as the "representations is fully alive" signal.
+        required_services = {
+            '/pfvtr/teach/set_dist',
+            '/pfvtr/repeat/set_dist',
+            '/pfvtr/set_camera_topic',
+            '/pfvtr/controller/set_parameters',
+        }
+        present_services = {name for name, _ in self.get_service_names_and_types()}
+        missing = sorted(required_services - present_services)
+
+        if not self.mapmaker_client.server_is_ready():
+            missing.append('mapmaker action server')
+        if not self.repeater_client.server_is_ready():
+            missing.append('repeater action server')
+
+        if missing:
+            self.readiness_var.set("Waiting for: " + ", ".join(missing))
+            self.readiness_label.config(foreground="orange")
+            self.root.after(500, self._check_stack_ready)
+            return
+
+        self.readiness_var.set("Stack ready — controls enabled.")
+        self.readiness_label.config(foreground="green")
+        for w in self._gated_widgets:
+            w.configure(state='normal')
+
+    def _fetch_initial_gains(self):
+        if not self.controller_get_param_client.wait_for_service(timeout_sec=0.0):
+            self.root.after(1000, self._fetch_initial_gains)
+            return
+
+        req = GetParameters.Request()
+        req.names = ["turn_gain", "velocity_gain"]
+        future = self.controller_get_param_client.call_async(req)
+        future.add_done_callback(self._initial_gains_done)
+
+    def _initial_gains_done(self, future):
+        try:
+            response = future.result()
+        except Exception as exc:
+            self.log_status(f"Could not fetch initial controller gains: {exc}")
+            return
+        if len(response.values) < 2:
+            self.log_status("Initial gains response had unexpected length; keeping defaults")
+            return
+        turn = response.values[0].double_value
+        vel = response.values[1].double_value
+        self.turn_gain_var.set(f"{turn}")
+        self.velocity_gain_var.set(f"{vel}")
+        msg = f"Loaded initial gains: turn_gain={turn} velocity_gain={vel}"
+        self.log_status(msg)
+        self.control_status_var.set(msg)
 
     def _param_set_done(self, future, name, value):
         try:
