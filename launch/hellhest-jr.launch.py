@@ -60,6 +60,18 @@ def generate_launch_description():
     choice_beta = DeclareLaunchArgument("choice_beta", default_value="2.5")
     matching_type = DeclareLaunchArgument("matching_type", default_value="siam")
 
+    navigation_method = DeclareLaunchArgument(
+        "navigation_method",
+        default_value="classic",
+        description=(
+            "Repeat-phase fusion method. "
+            "'classic' = Bearnav Classic image-based correction "
+            "(requires GUI/action image_pub == 0). "
+            "'pf2d' = particle filter using PF2D parameters "
+            "(particle_num, odom_error, etc.; requires image_pub >= 1)."
+        ),
+    )
+
 
     lc = LaunchConfiguration
 
@@ -85,6 +97,7 @@ def generate_launch_description():
                     "add_random": lc("add_random"),
                     "matching_type": lc("matching_type"),
                     "model_path": lc("model_path"),
+                    "navigation_method": lc("navigation_method"),
                 }],
             ),
 
@@ -155,5 +168,6 @@ def generate_launch_description():
         model_path,
         choice_beta,
         matching_type,
+        navigation_method,
         pfvtr_group,
     ])

@@ -58,6 +58,18 @@ def generate_launch_description():
     matching_type = DeclareLaunchArgument("matching_type", default_value="siam")
     turn_gain = DeclareLaunchArgument("turn_gain", default_value="0.05")
 
+    navigation_method = DeclareLaunchArgument(
+        "navigation_method",
+        default_value="classic",
+        description=(
+            "Repeat-phase fusion method. "
+            "'classic' = Bearnav Classic image-based correction "
+            "(requires GUI/action image_pub == 0). "
+            "'pf2d' = particle filter using PF2D parameters "
+            "(particle_num, odom_error, etc.; requires image_pub >= 1)."
+        ),
+    )
+
 
     lc = LaunchConfiguration
 
@@ -83,6 +95,7 @@ def generate_launch_description():
                     "add_random": lc("add_random"),
                     "matching_type": lc("matching_type"),
                     "model_path": lc("model_path"),
+                    "navigation_method": lc("navigation_method"),
                 }],
             ),
 
@@ -141,6 +154,9 @@ def generate_launch_description():
                 executable="vtr_gui.py",
                 name="vtr_gui",
                 output="screen",
+                parameters=[{
+                    "navigation_method": lc("navigation_method"),
+                }],
             ),
         ]
     )
@@ -162,5 +178,6 @@ def generate_launch_description():
         choice_beta,
         matching_type,
         turn_gain,
+        navigation_method,
         pfvtr_group,
     ])

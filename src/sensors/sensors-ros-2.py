@@ -33,10 +33,6 @@ PAD = 32
 NETWORK_DIVISION = 8
 RESIZE_W = 512
 
-# Repeat-phase fusion selector:
-#   False -> BearnavClassic (requires publish span 0 in the repeater)
-#   True  -> PF2D (particle filter, parameters from launch are important)
-USE_PF2D = False
 
 
 class SensorProcessingNode(Node):
@@ -55,6 +51,13 @@ class SensorProcessingNode(Node):
         self.declare_parameter("add_random", 0.01)
         self.declare_parameter("matching_type", "siam")
         self.declare_parameter("model_path", "")
+        # Repeat-phase fusion class. Two options:
+        #   "classic" -> BearnavClassic, image-based correction (requires
+        #                repeater image_pub == 0).
+        #   "pf2d"    -> PF2D particle filter; uses particle_num, odom_error,
+        #                dist_init_std, align_beta, align_init_std, choice_beta,
+        #                add_random declared above (requires image_pub >= 1).
+        self.declare_parameter("navigation_method", "classic")
 
         odom_topic = self.get_parameter("odom_topic").value
         particle_num = int(self.get_parameter("particle_num").value)
@@ -68,6 +71,13 @@ class SensorProcessingNode(Node):
         model_path = self.get_parameter("model_path").value
         if len(model_path) == 0:
             model_path = None
+        navigation_method = self.get_parameter("navigation_method").value
+        if navigation_method not in ("classic", "pf2d"):
+            raise Exception(
+                f"Invalid navigation_method '{navigation_method}' "
+                "- must be 'classic' or 'pf2d' (set via launch file)"
+            )
+        self.get_logger().info(f"Repeat-phase fusion: navigation_method={navigation_method}")
 
 
         align_abs = None
@@ -100,7 +110,7 @@ class SensorProcessingNode(Node):
             rel_align_service_name="local_alignment"
         )
 
-        if USE_PF2D:
+        if navigation_method == "pf2d":
             self.repeat_fusion = PF2D(
                 node=self,
                 type_prefix="repeat",

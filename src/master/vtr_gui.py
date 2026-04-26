@@ -9,6 +9,8 @@ from rclpy.node import Node
 from rclpy.action import ActionClient
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from nav_msgs.msg import Odometry
+from rcl_interfaces.srv import SetParameters
+from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 from pfvtr.action import MapMaker, MapRepeater
 from pfvtr.msg import FeaturesList
 
@@ -16,30 +18,51 @@ from pfvtr.msg import FeaturesList
 class VTRControlGUI(Node):
     def __init__(self):
         super().__init__('vtr_control_gui')
-        
+
+        self.declare_parameter("navigation_method", "classic")
+        self.navigation_method = self.get_parameter("navigation_method").value
+        if self.navigation_method not in ("classic", "pf2d"):
+            self.get_logger().warn(
+                f"Invalid navigation_method '{self.navigation_method}' "
+                "- falling back to 'classic'"
+            )
+            self.navigation_method = "classic"
+
         self.mapmaker_client = ActionClient(self, MapMaker, '/pfvtr/mapmaker')
         self.repeater_client = ActionClient(self, MapRepeater, '/pfvtr/repeater')
-        
+        self.controller_param_client = self.create_client(
+            SetParameters, '/pfvtr/controller/set_parameters'
+        )
+
         self.mapping_goal_handle = None
         self.repeating_goal_handle = None
         self.last_mapping_goal_was_start = False
-        
+
         self.root = tk.Tk()
         self.root.title("VT&R Control Panel")
-        self.root.geometry("500x700")
-        
-        self.setup_mapping_frame()
-        self.setup_repeating_frame()
-        self.setup_status_bar()
-        self.setup_hz_frame()
-        
+        self.root.geometry("500x720")
+
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill='both', expand=True, padx=5, pady=5)
+
+        self.actions_tab = ttk.Frame(self.notebook)
+        self.control_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.actions_tab, text="Actions")
+        self.notebook.add(self.control_tab, text="Control")
+
+        self.setup_mapping_frame(self.actions_tab)
+        self.setup_repeating_frame(self.actions_tab)
+        self.setup_status_bar(self.actions_tab)
+        self.setup_hz_frame(self.actions_tab)
+        self.setup_control_frame(self.control_tab)
+
         self.refresh_maps_list()
-        
+
         # Periodic ROS2 spinning
         self.root.after(20, self.spin_ros)
     
-    def setup_mapping_frame(self):
-        mapping_frame = ttk.LabelFrame(self.root, text="Mapping Controls", padding=10)
+    def setup_mapping_frame(self, parent):
+        mapping_frame = ttk.LabelFrame(parent, text="Mapping Controls", padding=10)
         mapping_frame.pack(fill='x', padx=10, pady=5)
         
         # Map name
@@ -84,8 +107,8 @@ class VTRControlGUI(Node):
                                            state='disabled')
         self.stop_mapping_btn.pack(side='left', padx=5)
     
-    def setup_repeating_frame(self):
-        repeating_frame = ttk.LabelFrame(self.root, text="Repeating Controls", padding=10)
+    def setup_repeating_frame(self, parent):
+        repeating_frame = ttk.LabelFrame(parent, text="Repeating Controls", padding=10)
         repeating_frame.pack(fill='x', padx=10, pady=5)
         
         # Map name with dropdown
@@ -127,18 +150,28 @@ class VTRControlGUI(Node):
         ttk.Checkbutton(repeating_frame, text="Use Distance-Based Navigation", 
                        variable=self.use_dist_var).grid(row=5, column=0, columnspan=2, sticky='w', pady=2)
         
-        # Image publish mode
-        ttk.Label(repeating_frame, text="Image Publish Mode:").grid(row=6, column=0, sticky='w', pady=2)
-        self.image_pub_var = tk.StringVar(value="0")
-        ttk.Entry(repeating_frame, textvariable=self.image_pub_var, width=5).grid(row=6, column=1, sticky='w', pady=2)
+        # Image publish mode — constraint depends on the navigation_method
+        # launch parameter: classic requires 0, pf2d requires >= 1.
+        if self.navigation_method == "classic":
+            image_pub_label = "Image Publish Mode (classic: 0):"
+            image_pub_default = "0"
+            image_pub_state = "disabled"
+        else:  # pf2d
+            image_pub_label = "Image Publish Mode (pf2d: ≥1):"
+            image_pub_default = "1"
+            image_pub_state = "normal"
+        ttk.Label(repeating_frame, text=image_pub_label).grid(row=6, column=0, sticky='w', pady=2)
+        self.image_pub_var = tk.StringVar(value=image_pub_default)
+        ttk.Entry(repeating_frame, textvariable=self.image_pub_var, width=5,
+                  state=image_pub_state).grid(row=6, column=1, sticky='w', pady=2)
         
         # Send button
         self.send_repeat_btn = ttk.Button(repeating_frame, text="SEND REPEAT COMMAND", 
                                           command=self.send_repeating_goal)
         self.send_repeat_btn.grid(row=7, column=0, columnspan=2, pady=10)
     
-    def setup_status_bar(self):
-        status_frame = ttk.LabelFrame(self.root, text="Status", padding=10)
+    def setup_status_bar(self, parent):
+        status_frame = ttk.LabelFrame(parent, text="Status", padding=10)
         status_frame.pack(fill='both', expand=True, padx=10, pady=5)
         
         self.status_text = tk.Text(status_frame, height=10, width=50, state='disabled')
@@ -147,8 +180,8 @@ class VTRControlGUI(Node):
         scrollbar = ttk.Scrollbar(status_frame, command=self.status_text.yview)
         self.status_text.configure(yscrollcommand=scrollbar.set)
 
-    def setup_hz_frame(self):
-        hz_frame = ttk.LabelFrame(self.root, text="Topic Rates", padding=5)
+    def setup_hz_frame(self, parent):
+        hz_frame = ttk.LabelFrame(parent, text="Topic Rates", padding=5)
         hz_frame.pack(fill='x', padx=10, pady=5)
 
         self.hz_label = ttk.Label(hz_frame, text="Cam: --   LiveRepr: --   Odom: --")
@@ -161,6 +194,92 @@ class VTRControlGUI(Node):
         self.repr_count = 0
         self._odom_sub = None
         self._repr_sub = None
+
+    def setup_control_frame(self, parent):
+        controller_frame = ttk.LabelFrame(parent, text="Controller Parameters", padding=10)
+        controller_frame.pack(fill='x', padx=10, pady=5)
+
+        ttk.Label(controller_frame, text="turn_gain:").grid(row=0, column=0, sticky='w', pady=4)
+        self.turn_gain_var = tk.StringVar(value="1.0")
+        ttk.Entry(controller_frame, textvariable=self.turn_gain_var, width=10).grid(
+            row=0, column=1, sticky='w', pady=4, padx=5
+        )
+        ttk.Button(
+            controller_frame, text="Apply",
+            command=lambda: self._apply_controller_param("turn_gain", self.turn_gain_var.get()),
+        ).grid(row=0, column=2, sticky='w', pady=4)
+
+        ttk.Label(controller_frame, text="velocity_gain:").grid(row=1, column=0, sticky='w', pady=4)
+        self.velocity_gain_var = tk.StringVar(value="1.0")
+        ttk.Entry(controller_frame, textvariable=self.velocity_gain_var, width=10).grid(
+            row=1, column=1, sticky='w', pady=4, padx=5
+        )
+        ttk.Button(
+            controller_frame, text="Apply",
+            command=lambda: self._apply_controller_param("velocity_gain", self.velocity_gain_var.get()),
+        ).grid(row=1, column=2, sticky='w', pady=4)
+
+        ttk.Label(
+            controller_frame,
+            text="Sets parameters live on /pfvtr/controller via SetParameters service.",
+            foreground="gray",
+        ).grid(row=2, column=0, columnspan=3, sticky='w', pady=(8, 0))
+
+        self.control_status_var = tk.StringVar(value="")
+        ttk.Label(controller_frame, textvariable=self.control_status_var,
+                  foreground="blue").grid(row=3, column=0, columnspan=3, sticky='w', pady=(4, 0))
+
+    def _apply_controller_param(self, name, raw_value):
+        try:
+            value = float(raw_value)
+        except ValueError:
+            msg = f"ERROR: '{name}' must be numeric, got '{raw_value}'"
+            self.log_status(msg)
+            self.control_status_var.set(msg)
+            return
+
+        if not self.controller_param_client.wait_for_service(timeout_sec=1.0):
+            msg = "ERROR: /pfvtr/controller/set_parameters not available (controller node running?)"
+            self.log_status(msg)
+            self.control_status_var.set(msg)
+            return
+
+        req = SetParameters.Request()
+        param = Parameter()
+        param.name = name
+        param.value = ParameterValue()
+        param.value.type = ParameterType.PARAMETER_DOUBLE
+        param.value.double_value = value
+        req.parameters = [param]
+
+        future = self.controller_param_client.call_async(req)
+        future.add_done_callback(
+            lambda fut, n=name, v=value: self._param_set_done(fut, n, v)
+        )
+
+    def _param_set_done(self, future, name, value):
+        try:
+            response = future.result()
+        except Exception as exc:
+            msg = f"ERROR setting {name}: {exc}"
+            self.log_status(msg)
+            self.control_status_var.set(msg)
+            return
+
+        if not response.results:
+            msg = f"ERROR setting {name}: empty result"
+            self.log_status(msg)
+            self.control_status_var.set(msg)
+            return
+        result = response.results[0]
+        if result.successful:
+            msg = f"Set {name} = {value}"
+            self.log_status(msg)
+            self.control_status_var.set(msg)
+        else:
+            msg = f"REJECTED {name}={value}: {result.reason}"
+            self.log_status(msg)
+            self.control_status_var.set(msg)
 
     def start_hz_measurement(self):
         self.hz_btn['state'] = 'disabled'
@@ -320,7 +439,14 @@ class VTRControlGUI(Node):
         except ValueError:
             self.log_status("ERROR: Invalid numeric values in fields!")
             return
-        
+
+        if self.navigation_method == "classic" and goal.image_pub != 0:
+            self.log_status("ERROR: classic mode requires image_pub == 0")
+            return
+        if self.navigation_method == "pf2d" and goal.image_pub < 1:
+            self.log_status("ERROR: pf2d mode requires image_pub >= 1")
+            return
+
         goal.map_name = self.repeat_map_name_var.get()
         goal.null_cmd = self.null_cmd_var.get()
         goal.use_dist = self.use_dist_var.get()
