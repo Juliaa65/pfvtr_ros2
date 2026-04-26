@@ -143,6 +143,7 @@ class RepeaterServer(Node):
         self.nearest_map_img = -1
         self.null_cmd = False
         self.savedOdomTopic = ""
+        self.last_closest_action_idx = -1
 
         self._active_goal_handle = None
 
@@ -398,8 +399,10 @@ class RepeaterServer(Node):
         if self.action_dists is not None and len(self.action_dists) > 0 and self.isRepeating:
             distance_to_pos = abs(self.curr_dist - self.action_dists)
             closest_idx = int(np.argmin(distance_to_pos))
-            self.get_logger().info("Replaying action " + str(closest_idx) + " at distance " + str(self.action_dists[closest_idx]) + " from current position " + str(self.curr_dist))
+            if closest_idx != self.last_closest_action_idx:
+                self.get_logger().info("Replaying action " + str(closest_idx) + " at distance " + str(self.action_dists[closest_idx]) + " from current position " + str(self.curr_dist))
             self._publish_vel(self.actions[closest_idx])
+            self.last_closest_action_idx = closest_idx
         else:
             self.get_logger().warn("No action available - stopping")
             req = SetDist.Request()

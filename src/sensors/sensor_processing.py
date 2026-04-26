@@ -445,8 +445,8 @@ class PF2D(SensorFusion):
             m = FloatList()
             m.data = list(particles_out)
             self.particles_pub.publish(m)
-            # rospy.loginfo("Outputted position: " + str(np.mean(self.particles[0, :])) + " +- " + str(np.std(self.particles[0, :])))
-            # rospy.loginfo("Outputted alignment: " + str(np.mean(self.particles[1, :])) + " +- " + str(np.std(self.particles[1, :])) + " with transitions: " + str(np.mean(curr_img_diff))
+            self._log.info("Outputted position: " + str(np.mean(self.particles[0, :])) + " +- " + str(np.std(self.particles[0, :])))
+            self._log.info("Outputted alignment: " + str(np.mean(self.particles[1, :])) + " +- " + str(np.std(self.particles[1, :])) + " with transitions: " + str(np.mean(curr_img_diff)))
             #               + " and " + str(np.mean(trans_diff)))
 
             # rospy.logwarn(
