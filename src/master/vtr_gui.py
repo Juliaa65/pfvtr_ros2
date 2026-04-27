@@ -76,6 +76,21 @@ class VTRControlGUI(Node):
         # driven by goal acceptance.
         self._gated_widgets = []
 
+        # Teleport widgets have an additional gate on top of stack readiness:
+        # they only make sense when something subscribes to /initialpose
+        # (the voxels sim does, real-world robot doesn't).
+        self._teleport_widgets = []
+        self._stack_ready = False
+
+        # Topic-rate gate. Buttons stay disabled until a measurement confirms
+        # all required navigation topics are publishing at non-zero rates.
+        # `_measuring`: True while a measurement subscription is live.
+        # `_measurement_after_id`: outstanding root.after() id for the next
+        # auto-retry, so Refresh can cancel a pending wait.
+        self._topics_ready = False
+        self._measuring = False
+        self._measurement_after_id = None
+
         self.readiness_var = tk.StringVar(value="Waiting for stack...")
         self.readiness_label = tk.Label(
             self.root, textvariable=self.readiness_var,
@@ -91,10 +106,12 @@ class VTRControlGUI(Node):
         self.notebook.add(self.actions_tab, text="Actions")
         self.notebook.add(self.control_tab, text="Control")
 
+        # Topic-rate frame goes first so it sits at the top of the Actions
+        # tab — it gates every other button below it.
+        self.setup_hz_frame(self.actions_tab)
         self.setup_mapping_frame(self.actions_tab)
         self.setup_repeating_frame(self.actions_tab)
         self.setup_status_bar(self.actions_tab)
-        self.setup_hz_frame(self.actions_tab)
         self.setup_control_frame(self.control_tab)
 
         self.refresh_maps_list()
@@ -113,6 +130,14 @@ class VTRControlGUI(Node):
         # guarantees that by the time buttons are enabled, every node has
         # finished __init__ (incl. NN model loading in `representations`).
         self.root.after(500, self._check_stack_ready)
+
+        # Auto-start the topic-rate measurement at bringup. The loop retries
+        # every 5 s until every required topic is non-zero, then stops.
+        self.root.after(500, self._start_topic_measurement)
+
+        # Watches for subscribers on /initialpose and gates teleport buttons
+        # accordingly. Runs forever so disconnects also re-disable the buttons.
+        self.root.after(500, self._update_teleport_availability)
 
         # Periodic ROS2 spinning
         self.root.after(20, self.spin_ros)
@@ -189,7 +214,7 @@ class VTRControlGUI(Node):
             command=self._teleport_to_map_start, state='disabled',
         )
         self.teleport_to_map_btn.pack(side='left', padx=5)
-        self._gated_widgets.append(self.teleport_to_map_btn)
+        self._teleport_widgets.append(self.teleport_to_map_btn)
         
         # Start position
         ttk.Label(repeating_frame, text="Start Position:").grid(row=1, column=0, sticky='w', pady=2)
@@ -257,13 +282,17 @@ class VTRControlGUI(Node):
         self.status_text.configure(yscrollcommand=scrollbar.set)
 
     def setup_hz_frame(self, parent):
-        hz_frame = ttk.LabelFrame(parent, text="Topic Rates", padding=5)
+        hz_frame = ttk.LabelFrame(parent, text="Topic Rates (gates all controls)", padding=5)
         hz_frame.pack(fill='x', padx=10, pady=5)
 
         self.hz_label = ttk.Label(hz_frame, text="Cam: --   LiveRepr: --   Odom: --")
         self.hz_label.pack(side='left', padx=5)
 
-        self.hz_btn = ttk.Button(hz_frame, text="Measure", command=self.start_hz_measurement)
+        # Single button that force-restarts the auto-measurement loop. The
+        # measurement runs automatically at bringup and retries every 5 s
+        # until all rates are non-zero; this button exists for the case where
+        # the user wants to re-check after fixing a topic on their own.
+        self.hz_btn = ttk.Button(hz_frame, text="Refresh", command=self._refresh_topic_rates)
         self.hz_btn.pack(side='right', padx=5)
 
         self.odom_count = 0
@@ -337,7 +366,7 @@ class VTRControlGUI(Node):
             command=self._send_teleport, state='disabled',
         )
         self.teleport_btn.grid(row=3, column=0, columnspan=2, sticky='w', pady=(8, 0))
-        self._gated_widgets.append(self.teleport_btn)
+        self._teleport_widgets.append(self.teleport_btn)
 
         ttk.Label(
             teleport_frame,
@@ -434,10 +463,42 @@ class VTRControlGUI(Node):
             self.root.after(500, self._check_stack_ready)
             return
 
-        self.readiness_var.set("Stack ready — controls enabled.")
-        self.readiness_label.config(foreground="green")
+        self._stack_ready = True
+        self._update_widget_gates()
+
+    def _update_widget_gates(self):
+        # Single source of truth for enabling the gated control buttons.
+        # Both gates must pass: stack services up AND every required topic
+        # publishing at non-zero rate.
+        ready = self._stack_ready and self._topics_ready
+        state = 'normal' if ready else 'disabled'
         for w in self._gated_widgets:
-            w.configure(state='normal')
+            w.configure(state=state)
+
+        if ready:
+            self.readiness_var.set("Stack ready — controls enabled.")
+            self.readiness_label.config(foreground="green")
+        elif self._stack_ready:
+            self.readiness_var.set(
+                "Stack ready — waiting for non-zero topic rates..."
+            )
+            self.readiness_label.config(foreground="orange")
+        # If !_stack_ready, _check_stack_ready owns the readiness label.
+
+    def _update_teleport_availability(self):
+        # Teleport buttons require everything the other buttons require, plus
+        # at least one node subscribed to /initialpose. Voxels sim subscribes;
+        # a real-world robot typically does not, so the buttons stay disabled
+        # and clicking them would be a no-op there.
+        try:
+            sub_count = self.teleport_pub.get_subscription_count()
+        except Exception:
+            sub_count = 0
+        ready = self._stack_ready and self._topics_ready and sub_count > 0
+        state = 'normal' if ready else 'disabled'
+        for w in self._teleport_widgets:
+            w.configure(state=state)
+        self.root.after(1000, self._update_teleport_availability)
 
     def _fetch_initial_gains(self):
         if not self.controller_get_param_client.wait_for_service(timeout_sec=0.0):
@@ -490,8 +551,25 @@ class VTRControlGUI(Node):
             self.log_status(msg)
             self.control_status_var.set(msg)
 
-    def start_hz_measurement(self):
+    # ----- Topic-rate gate -------------------------------------------------
+    # Auto-runs at bringup; retries every 5 s until every required rate is
+    # non-zero, then stops. Refresh forces a re-run, which also re-disables
+    # the gated buttons until the next measurement passes.
+
+    MEASUREMENT_DURATION_S = 3.0
+    RETRY_DELAY_MS = 5000
+
+    def _start_topic_measurement(self):
+        if self._measuring:
+            return
+        if self._measurement_after_id is not None:
+            self.root.after_cancel(self._measurement_after_id)
+            self._measurement_after_id = None
+
+        self._measuring = True
+        self._topics_ready = False
         self.hz_btn['state'] = 'disabled'
+        self._update_widget_gates()
         self.hz_label.config(text="Measuring...")
         self.odom_count = 0
         self.repr_count = 0
@@ -499,7 +577,7 @@ class VTRControlGUI(Node):
         hz_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT, durability=DurabilityPolicy.VOLATILE)
         self._odom_sub = self.create_subscription(Odometry, '/odometry_publisher', self._odom_cb, hz_qos)
         self._repr_sub = self.create_subscription(FeaturesList, '/pfvtr/live_representation', self._repr_cb, hz_qos)
-        self.root.after(3000, self.finish_hz_measurement)
+        self.root.after(int(self.MEASUREMENT_DURATION_S * 1000), self._finish_topic_measurement)
 
     def _odom_cb(self, msg):
         self.odom_count += 1
@@ -507,7 +585,7 @@ class VTRControlGUI(Node):
     def _repr_cb(self, msg):
         self.repr_count += 1
 
-    def finish_hz_measurement(self):
+    def _finish_topic_measurement(self):
         if self._odom_sub is not None:
             self.destroy_subscription(self._odom_sub)
             self._odom_sub = None
@@ -515,12 +593,37 @@ class VTRControlGUI(Node):
             self.destroy_subscription(self._repr_sub)
             self._repr_sub = None
 
-        odom_hz = self.odom_count / 3.0
-        repr_hz = self.repr_count / 3.0
-        cam_hz = odom_hz
+        duration = self.MEASUREMENT_DURATION_S
+        odom_hz = self.odom_count / duration
+        repr_hz = self.repr_count / duration
+        cam_hz = odom_hz  # cam is aliased to odom in the existing label
 
-        self.hz_label.config(text=f"Cam: {cam_hz:.1f} Hz   LiveRepr: {repr_hz:.1f} Hz   Odom: {odom_hz:.1f} Hz")
+        self.hz_label.config(
+            text=f"Cam: {cam_hz:.1f} Hz   LiveRepr: {repr_hz:.1f} Hz   Odom: {odom_hz:.1f} Hz"
+        )
+        self._measuring = False
         self.hz_btn['state'] = 'normal'
+
+        all_nonzero = odom_hz > 0 and repr_hz > 0
+        self._topics_ready = all_nonzero
+        self._update_widget_gates()
+
+        if not all_nonzero:
+            # Keep retrying until every rate is non-zero. Once ready, we stop
+            # measuring as requested — Refresh is the only way to re-trigger.
+            self._measurement_after_id = self.root.after(
+                self.RETRY_DELAY_MS, self._start_topic_measurement
+            )
+
+    def _refresh_topic_rates(self):
+        # User-clicked: cancel any pending retry, drop the topic-ready gate,
+        # and start a fresh measurement immediately.
+        if self._measurement_after_id is not None:
+            self.root.after_cancel(self._measurement_after_id)
+            self._measurement_after_id = None
+        self._topics_ready = False
+        self._update_widget_gates()
+        self._start_topic_measurement()
     
     def log_status(self, message):
         self.status_text.configure(state='normal')
