@@ -31,7 +31,7 @@ def generate_launch_description():
 
     odom_topic = DeclareLaunchArgument(
         "odom_topic",
-        default_value="/robot1/odometry",
+        default_value="REQUIRED",
         description=(
             "Odometry topic the GUI subscribes to for the rate-readiness "
             "measurement. Must match the `odom_topic` passed to the robot's "
@@ -41,7 +41,7 @@ def generate_launch_description():
 
     camera_topic = DeclareLaunchArgument(
         "camera_topic",
-        default_value="/robot1/camera1/image",
+        default_value="REQUIRED",
         description=(
             "Camera topic the GUI subscribes to for the rate-readiness "
             "measurement. Must match the `camera_topic` passed to the robot's "
