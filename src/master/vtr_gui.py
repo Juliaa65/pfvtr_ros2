@@ -21,6 +21,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from rclpy.serialization import deserialize_message
 import rosbag2_py
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import Image
 from rcl_interfaces.srv import SetParameters, GetParameters
 from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 from geometry_msgs.msg import PoseWithCovarianceStamped
@@ -42,6 +43,15 @@ class VTRControlGUI(Node):
             )
             self.navigation_method = "classic"
 
+        # The GUI subscribes to the same `odom_topic` and `camera_topic`
+        # the robot's stack was launched with — both are wired from the
+        # same launch args so they cannot drift. Defaults mirror the
+        # `sensors-ros-2.py` / `representations-ros-2.py` defaults.
+        self.declare_parameter("odom_topic", "/robot1/odometry")
+        self.odom_topic = self.get_parameter("odom_topic").value
+        self.declare_parameter("camera_topic", "/robot1/camera1/image")
+        self.camera_topic = self.get_parameter("camera_topic").value
+
         self.mapmaker_client = ActionClient(self, MapMaker, '/pfvtr/mapmaker')
         self.repeater_client = ActionClient(self, MapRepeater, '/pfvtr/repeater')
         self.controller_param_client = self.create_client(
@@ -53,6 +63,14 @@ class VTRControlGUI(Node):
         # Map list is served by the repeater so the GUI lists *its* maps even
         # when running on a different machine via Zenoh.
         self.get_maps_client = self.create_client(GetMaps, '/pfvtr/get_maps')
+        # `sensors` declares navigation_method; we fetch it from there so the
+        # robot is the single source of truth (the GUI may be on a different
+        # machine, where its own launch arg would be a duplicate to keep in
+        # sync). Falls back to the locally-declared default if the robot is
+        # unreachable.
+        self.sensors_get_param_client = self.create_client(
+            GetParameters, '/pfvtr/sensors/get_parameters'
+        )
         # /initialpose is the rviz "2D Pose Estimate" topic.  The voxels
         # simulator subscribes to it and teleports the robot to the given
         # x, y, yaw (yaw extracted from the quaternion).
@@ -127,6 +145,7 @@ class VTRControlGUI(Node):
         # the controller node isn't up yet we re-arm in 1 s; the GUI never
         # blocks waiting for it.
         self.root.after(500, self._fetch_initial_gains)
+        self.root.after(500, self._fetch_navigation_method)
 
         # Block any user-triggered ROS calls until the rest of the stack is
         # initialized.  We wait on the same set/dist services the mapmaker
@@ -246,7 +265,9 @@ class VTRControlGUI(Node):
                        variable=self.use_dist_var).grid(row=5, column=0, columnspan=2, sticky='w', pady=2)
         
         # Image publish mode — constraint depends on the navigation_method
-        # launch parameter: classic requires 0, pf2d requires >= 1.
+        # the robot is running: classic requires 0, pf2d requires >= 1.
+        # The widgets are saved as attributes so `_apply_navigation_method`
+        # can re-style them once the value is fetched from /pfvtr/sensors.
         if self.navigation_method == "classic":
             image_pub_label = "Image Publish Mode (classic: 0):"
             image_pub_default = "0"
@@ -255,10 +276,12 @@ class VTRControlGUI(Node):
             image_pub_label = "Image Publish Mode (pf2d: ≥1):"
             image_pub_default = "1"
             image_pub_state = "normal"
-        ttk.Label(repeating_frame, text=image_pub_label).grid(row=6, column=0, sticky='w', pady=2)
+        self.image_pub_label = ttk.Label(repeating_frame, text=image_pub_label)
+        self.image_pub_label.grid(row=6, column=0, sticky='w', pady=2)
         self.image_pub_var = tk.StringVar(value=image_pub_default)
-        ttk.Entry(repeating_frame, textvariable=self.image_pub_var, width=5,
-                  state=image_pub_state).grid(row=6, column=1, sticky='w', pady=2)
+        self.image_pub_entry = ttk.Entry(repeating_frame, textvariable=self.image_pub_var,
+                                         width=5, state=image_pub_state)
+        self.image_pub_entry.grid(row=6, column=1, sticky='w', pady=2)
         
         # Send / Stop buttons.  STOP is not in `_gated_widgets` because it
         # has its own state machine driven by goal acceptance / completion,
@@ -302,8 +325,10 @@ class VTRControlGUI(Node):
 
         self.odom_count = 0
         self.repr_count = 0
+        self.cam_count = 0
         self._odom_sub = None
         self._repr_sub = None
+        self._cam_sub = None
 
     def setup_control_frame(self, parent):
         controller_frame = ttk.LabelFrame(parent, text="Controller Parameters", padding=10)
@@ -517,6 +542,51 @@ class VTRControlGUI(Node):
         future = self.controller_get_param_client.call_async(req)
         future.add_done_callback(self._initial_gains_done)
 
+    def _fetch_navigation_method(self):
+        # Robot is the source of truth for navigation_method (it's what
+        # /pfvtr/sensors was actually launched with). Retry until the param
+        # service is reachable, then apply the value to the Repeating-tab UI.
+        if not self.sensors_get_param_client.wait_for_service(timeout_sec=0.0):
+            self.root.after(1000, self._fetch_navigation_method)
+            return
+
+        req = GetParameters.Request()
+        req.names = ["navigation_method"]
+        future = self.sensors_get_param_client.call_async(req)
+        future.add_done_callback(self._navigation_method_done)
+
+    def _navigation_method_done(self, future):
+        try:
+            response = future.result()
+        except Exception as exc:
+            self.root.after(0, lambda e=exc: self.log_status(
+                f"Could not fetch navigation_method from sensors: {e}"
+            ))
+            return
+        if not response.values:
+            return
+        method = response.values[0].string_value
+        if method not in ("classic", "pf2d"):
+            self.root.after(0, lambda m=method: self.log_status(
+                f"Robot reported unknown navigation_method '{m}', keeping '{self.navigation_method}'"
+            ))
+            return
+        self.root.after(0, lambda m=method: self._apply_navigation_method(m))
+
+    def _apply_navigation_method(self, method):
+        if method == self.navigation_method:
+            return
+        self.navigation_method = method
+        if method == "classic":
+            self.image_pub_label.config(text="Image Publish Mode (classic: 0):")
+            self.image_pub_var.set("0")
+            self.image_pub_entry.config(state="disabled")
+        else:  # pf2d
+            self.image_pub_label.config(text="Image Publish Mode (pf2d: ≥1):")
+            self.image_pub_var.set("1")
+            self.image_pub_entry.config(state="normal")
+        self.log_status(f"navigation_method synced from robot: {method}")
+
     def _initial_gains_done(self, future):
         try:
             response = future.result()
@@ -580,10 +650,12 @@ class VTRControlGUI(Node):
         self.hz_label.config(text="Measuring...")
         self.odom_count = 0
         self.repr_count = 0
+        self.cam_count = 0
 
         hz_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT, durability=DurabilityPolicy.VOLATILE)
-        self._odom_sub = self.create_subscription(Odometry, '/odometry_publisher', self._odom_cb, hz_qos)
+        self._odom_sub = self.create_subscription(Odometry, self.odom_topic, self._odom_cb, hz_qos)
         self._repr_sub = self.create_subscription(FeaturesList, '/pfvtr/live_representation', self._repr_cb, hz_qos)
+        self._cam_sub = self.create_subscription(Image, self.camera_topic, self._cam_cb, hz_qos)
         self.root.after(int(self.MEASUREMENT_DURATION_S * 1000), self._finish_topic_measurement)
 
     def _odom_cb(self, msg):
@@ -592,6 +664,9 @@ class VTRControlGUI(Node):
     def _repr_cb(self, msg):
         self.repr_count += 1
 
+    def _cam_cb(self, msg):
+        self.cam_count += 1
+
     def _finish_topic_measurement(self):
         if self._odom_sub is not None:
             self.destroy_subscription(self._odom_sub)
@@ -599,11 +674,14 @@ class VTRControlGUI(Node):
         if self._repr_sub is not None:
             self.destroy_subscription(self._repr_sub)
             self._repr_sub = None
+        if self._cam_sub is not None:
+            self.destroy_subscription(self._cam_sub)
+            self._cam_sub = None
 
         duration = self.MEASUREMENT_DURATION_S
         odom_hz = self.odom_count / duration
         repr_hz = self.repr_count / duration
-        cam_hz = odom_hz  # cam is aliased to odom in the existing label
+        cam_hz = self.cam_count / duration
 
         self.hz_label.config(
             text=f"Cam: {cam_hz:.1f} Hz   LiveRepr: {repr_hz:.1f} Hz   Odom: {odom_hz:.1f} Hz"
@@ -611,7 +689,7 @@ class VTRControlGUI(Node):
         self._measuring = False
         self.hz_btn['state'] = 'normal'
 
-        all_nonzero = odom_hz > 0 and repr_hz > 0
+        all_nonzero = odom_hz > 0 and repr_hz > 0 and cam_hz > 0
         self._topics_ready = all_nonzero
         self._update_widget_gates()
 

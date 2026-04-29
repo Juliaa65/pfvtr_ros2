@@ -155,7 +155,10 @@ def generate_launch_description():
                 name="vtr_gui",
                 output="screen",
                 parameters=[{
-                    "navigation_method": lc("navigation_method"),
+                    # navigation_method is fetched at runtime from
+                    # /pfvtr/sensors — the robot is the source of truth.
+                    "odom_topic": lc("odom_topic"),
+                    "camera_topic": lc("camera_topic"),
                 }],
             ),
         ]
