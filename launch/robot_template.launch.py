@@ -56,7 +56,7 @@ def generate_launch_description():
 
     choice_beta = DeclareLaunchArgument("choice_beta", default_value="2.5")
     matching_type = DeclareLaunchArgument("matching_type", default_value="siam")
-    turn_gain = DeclareLaunchArgument("turn_gain", default_value="0.05")
+    turn_gain = DeclareLaunchArgument("turn_gain", default_value="1.0")
 
     navigation_method = DeclareLaunchArgument(
         "navigation_method",
