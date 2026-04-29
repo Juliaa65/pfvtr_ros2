@@ -24,7 +24,7 @@ from cv_bridge import CvBridge
 
 from pfvtr.action import MapRepeater
 from pfvtr.msg import SensorsInput, SensorsOutput, Features, Histogram, DistancedTwist
-from pfvtr.srv import SetDist, SetClockGain, StopRepeater
+from pfvtr.srv import SetDist, SetClockGain, StopRepeater, GetMaps
 
 NAVIGATION_QOS = QoSProfile(
     depth=1,
@@ -178,6 +178,7 @@ class RepeaterServer(Node):
 
         self.create_service(SetClockGain, "set_clock_gain", self.setClockGain)
         self.create_service(StopRepeater, "stop_repeater", self.stopService)
+        self.create_service(GetMaps, "get_maps", self.getMapsService)
         
         cb_group = get_exclusive_callback_group()
         self.distance_sub = self.create_subscription(
@@ -210,6 +211,19 @@ class RepeaterServer(Node):
     def stopService(self, req, resp):
         self.isRepeating = False
         self.get_logger().warn("Received stop request!")
+        return resp
+
+    def getMapsService(self, req, resp):
+        # Source of truth for available maps lives on whichever machine
+        # runs the repeater (the robot). The GUI calls this so it lists the
+        # robot's maps over Zenoh, not its own local `maps/`.
+        maps = []
+        if os.path.isdir(MAPS_DIR):
+            for item in sorted(os.listdir(MAPS_DIR)):
+                full = os.path.join(MAPS_DIR, item)
+                if os.path.isdir(full) and os.path.exists(os.path.join(full, "params")):
+                    maps.append(item)
+        resp.maps = maps
         return resp
 
 

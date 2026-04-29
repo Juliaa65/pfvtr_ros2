@@ -26,6 +26,7 @@ from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from pfvtr.action import MapMaker, MapRepeater
 from pfvtr.msg import FeaturesList
+from pfvtr.srv import GetMaps
 
 
 class VTRControlGUI(Node):
@@ -49,6 +50,9 @@ class VTRControlGUI(Node):
         self.controller_get_param_client = self.create_client(
             GetParameters, '/pfvtr/controller/get_parameters'
         )
+        # Map list is served by the repeater so the GUI lists *its* maps even
+        # when running on a different machine via Zenoh.
+        self.get_maps_client = self.create_client(GetMaps, '/pfvtr/get_maps')
         # /initialpose is the rviz "2D Pose Estimate" topic.  The voxels
         # simulator subscribes to it and teleports the robot to the given
         # x, y, yaw (yaw extracted from the quaternion).
@@ -113,8 +117,9 @@ class VTRControlGUI(Node):
         self.setup_repeating_frame(self.actions_tab)
         self.setup_status_bar(self.actions_tab)
         self.setup_control_frame(self.control_tab)
-
-        self.refresh_maps_list()
+        # Map list is populated by `_check_stack_ready` once the repeater's
+        # GetMaps service is reachable; the Refresh button can be used
+        # afterwards to re-fetch.
 
         # Pull current controller gains from the parameter server so the
         # entries reflect the launch-configured (or live-updated) values
@@ -465,6 +470,8 @@ class VTRControlGUI(Node):
 
         self._stack_ready = True
         self._update_widget_gates()
+        # Repeater is up now, so the GetMaps service is reachable.
+        self.refresh_maps_list()
 
     def _update_widget_gates(self):
         # Single source of truth for enabling the gated control buttons.
@@ -632,20 +639,34 @@ class VTRControlGUI(Node):
         self.status_text.configure(state='disabled')
     
     def refresh_maps_list(self):
-        maps = []
-        if not os.path.isdir(MAPS_DIR):
+        # Maps live on whichever host runs the repeater (the robot). The GUI
+        # may be running on a different machine over Zenoh, so we query the
+        # repeater's GetMaps service instead of scanning the local `maps/`.
+        if not self.get_maps_client.wait_for_service(timeout_sec=0.3):
             self.map_combobox['values'] = []
             self.log_status(
-                f"No '{MAPS_DIR}/' directory yet — record a map to create it."
+                "Repeater not reachable — start the navigation stack and click Refresh."
             )
             return
 
-        for item in os.listdir(MAPS_DIR):
-            full = os.path.join(MAPS_DIR, item)
-            if os.path.isdir(full) and os.path.exists(os.path.join(full, 'params')):
-                maps.append(item)
+        future = self.get_maps_client.call_async(GetMaps.Request())
+        future.add_done_callback(self._refresh_maps_done)
 
-        maps.sort()
+    def _refresh_maps_done(self, future):
+        try:
+            response = future.result()
+        except Exception as exc:
+            # Done-callbacks fire on the rclpy thread; marshal Tk updates back
+            # to the GUI thread via root.after.
+            self.root.after(0, lambda e=exc: self.log_status(
+                f"Failed to fetch maps from repeater: {e}"
+            ))
+            return
+
+        maps = list(response.maps)
+        self.root.after(0, lambda: self._apply_maps_list(maps))
+
+    def _apply_maps_list(self, maps):
         self.map_combobox['values'] = maps
         if maps:
             self.map_combobox.current(0)
