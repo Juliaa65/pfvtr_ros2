@@ -1,3 +1,4 @@
+import threading
 from abc import ABC, abstractmethod
 from typing import List
 import numpy as np
@@ -260,6 +261,15 @@ class SensorFusion(ABC):
         self.abs_align_est = abs_align_est
         self.rel_align_est = rel_align_est
         self.repr_creator = repr_creator
+
+        # Serializes the three PF2D methods that mutate particle state
+        # (set_distance, _process_abs_alignment, _process_rel_distance) against
+        # each other. The set_dist/set_align services live in the node's
+        # default callback group while subscriptions run in a dedicated
+        # MutuallyExclusiveCallbackGroup, so the two can interleave under
+        # MultiThreadedExecutor and produce inconsistent (particles,
+        # particle_prob) shapes mid-update.
+        self._particle_lock = threading.Lock()
 
 
 

@@ -209,29 +209,30 @@ class PF2D(SensorFusion):
 
 
     def set_distance(self, request: SetDist.Request, response: SetDist.Response):
-        self.fallback_bearnav = False
-        response = super(PF2D, self).set_distance(request, response)
+        with self._particle_lock:
+            self.fallback_bearnav = False
+            response = super(PF2D, self).set_distance(request, response)
 
-        var = (self.odom_init_std, self.align_init_std, 0)
-        dst = self.distance
-        self.init_distance = self.distance
-        self.particles = np.transpose(
-            np.ones((3, self.particles_num)).transpose() * np.array((dst, 0, 0))
-            + self.rng.normal(loc=(0, 0, 0), scale=var, size=(self.particles_num, 3)))
-        # self.particles = self.particles - np.mean(self.particles, axis=-1, keepdims=True)
-        # Repeats always begin on map index 0; the true map count is learned
-        # from SensorsInput.map_num in _process_abs_alignment (SetDist.map_num
-        # carries the starting *index* for base-class compatibility).
-        self.particles[2] = 0
-        self.particle_prob = np.ones(self.particles_num) / self.particles_num
-        self.last_image = None
-        self._get_coords()
+            var = (self.odom_init_std, self.align_init_std, 0)
+            dst = self.distance
+            self.init_distance = self.distance
+            self.particles = np.transpose(
+                np.ones((3, self.particles_num)).transpose() * np.array((dst, 0, 0))
+                + self.rng.normal(loc=(0, 0, 0), scale=var, size=(self.particles_num, 3)))
+            # self.particles = self.particles - np.mean(self.particles, axis=-1, keepdims=True)
+            # Repeats always begin on map index 0; the true map count is learned
+            # from SensorsInput.map_num in _process_abs_alignment (SetDist.map_num
+            # carries the starting *index* for base-class compatibility).
+            self.particles[2] = 0
+            self.particle_prob = np.ones(self.particles_num) / self.particles_num
+            self.last_image = None
+            self._get_coords()
 
-        self._log.info(
-            "Particles reinitialized at position " + str(self.distance) + "m"
-            + " with alignment " + str(self.alignment)
-        )
-        return response
+            self._log.info(
+                "Particles reinitialized at position " + str(self.distance) + "m"
+                + " with alignment " + str(self.alignment)
+            )
+            return response
 
     def _process_rel_alignment(self, request: Alignment.Request):
         histogram = self.rel_align_est.displacement_message_callback(request.input)
@@ -261,207 +262,209 @@ class PF2D(SensorFusion):
         return out
 
     def _process_abs_alignment(self, msg):
-        # Parse all data from the incoming message
-        curr_time = _builtin_stamp_to_rclpy_time(msg.header.stamp, self._clock)
-        self.header = msg.header
-        # Authoritative map count lives on the live stream; SetDist can't
-        # carry it without colliding with the base class's index semantics.
-        self.map_num = max(1, int(msg.map_num))
-        if self.last_time is None:
-            self.last_time = curr_time
-            return
+        with self._particle_lock:
+            # Parse all data from the incoming message
+            curr_time = _builtin_stamp_to_rclpy_time(msg.header.stamp, self._clock)
+            self.header = msg.header
+            # Authoritative map count lives on the live stream; SetDist can't
+            # carry it without colliding with the base class's index semantics.
+            self.map_num = max(1, int(msg.map_num))
+            if self.last_time is None:
+                self.last_time = curr_time
+                return
 
-        dists = np.array(msg.map_distances)
-        len_per_map = np.size(dists) // self.map_num
+            dists = np.array(msg.map_distances)
+            len_per_map = np.size(dists) // self.map_num
 
-        if len_per_map == 1:
-            self._log.error("!!!Only one image matched - fallback to bearnav classic!!!")
-            self.fallback_bearnav = True
-            # self.distance = self.init_distance
+            if len_per_map == 1:
+                self._log.error("!!!Only one image matched - fallback to bearnav classic!!!")
+                self.fallback_bearnav = True
+                # self.distance = self.init_distance
 
-        if self.fallback_bearnav:
-            histogram = np.array(msg.map_histograms[0].values).reshape(msg.map_histograms[0].shape)
-            self.alignment = (np.argmax(histogram) - np.size(histogram) // 2) / (np.size(histogram) // 2)
-            self._log.info("Fallback displacement: " + str(self.alignment))
-            return
+            if self.fallback_bearnav:
+                histogram = np.array(msg.map_histograms[0].values).reshape(msg.map_histograms[0].shape)
+                self.alignment = (np.argmax(histogram) - np.size(histogram) // 2) / (np.size(histogram) // 2)
+                self._log.info("Fallback displacement: " + str(self.alignment))
+                return
 
-        hists = np.array(msg.map_histograms[0].values).reshape(msg.map_histograms[0].shape)
-        self.last_hists = hists
-        map_trans = np.array(msg.map_transitions[0].values).reshape(msg.map_transitions[0].shape)
-        live_hist = np.array(msg.live_histograms[0].values).reshape(msg.live_histograms[0].shape)
-        hist_width = hists.shape[-1]
-        shifts = np.round(np.array(msg.map_offset) * (hist_width // 2)).astype(int)
-        hists = np.roll(hists, shifts, -1) # not sure if last dim should be rolled like this
-        curr_img_diff = self._sample_hist([live_hist])
-        curr_time_diff = _duration_to_sec(curr_time - self.last_time)
-        timestamps = msg.map_timestamps
-        traveled = self.traveled_dist
+            hists = np.array(msg.map_histograms[0].values).reshape(msg.map_histograms[0].shape)
+            self.last_hists = hists
+            map_trans = np.array(msg.map_transitions[0].values).reshape(msg.map_transitions[0].shape)
+            live_hist = np.array(msg.live_histograms[0].values).reshape(msg.live_histograms[0].shape)
+            hist_width = hists.shape[-1]
+            shifts = np.round(np.array(msg.map_offset) * (hist_width // 2)).astype(int)
+            hists = np.roll(hists, shifts, -1) # not sure if last dim should be rolled like this
+            curr_img_diff = self._sample_hist([live_hist])
+            curr_time_diff = _duration_to_sec(curr_time - self.last_time)
+            timestamps = msg.map_timestamps
+            traveled = self.traveled_dist
 
-        # Divide incoming data according the map affiliation
-        trans_per_map = len_per_map - 1
-        if len(dists) % msg.map_num > 0:
-            # TODO: this assumes that there is same number of features comming from all the maps (this does not have to hold when 2*map_len < lookaround)
-            # however the mapmaker was updated so that the new maps should have always the same number of images, unless some major error occurs
-            self._log.warn("!!!!!!!!!!!!!!!!!! One map has more images than other !!!!!!!!!!!!!!!!")
-            return
+            # Divide incoming data according the map affiliation
+            trans_per_map = len_per_map - 1
+            if len(dists) % msg.map_num > 0:
+                # TODO: this assumes that there is same number of features comming from all the maps (this does not have to hold when 2*map_len < lookaround)
+                # however the mapmaker was updated so that the new maps should have always the same number of images, unless some major error occurs
+                self._log.warn("!!!!!!!!!!!!!!!!!! One map has more images than other !!!!!!!!!!!!!!!!")
+                return
 
-        map_trans = [map_trans[trans_per_map * map_idx:trans_per_map * (map_idx + 1)] for map_idx in range(self.map_num)]
-        hists = [hists[len_per_map * map_idx:len_per_map * (map_idx + 1)] for map_idx in range(self.map_num)]
-        dists = np.array([dists[len_per_map * map_idx:len_per_map * (map_idx + 1)] for map_idx in range(self.map_num)])
-        timestamps = [timestamps[len_per_map * map_idx:len_per_map * (map_idx + 1)] for map_idx in range(self.map_num)]
-        time_diffs = [self._get_time_diff(timestamps[map_idx]) for map_idx in range(self.map_num)]
-        if self.map_num > 1:
-            # transition matrix for between maps
-            map_matrix = msg.map_transitions
+            map_trans = [map_trans[trans_per_map * map_idx:trans_per_map * (map_idx + 1)] for map_idx in range(self.map_num)]
+            hists = [hists[len_per_map * map_idx:len_per_map * (map_idx + 1)] for map_idx in range(self.map_num)]
+            dists = np.array([dists[len_per_map * map_idx:len_per_map * (map_idx + 1)] for map_idx in range(self.map_num)])
+            timestamps = [timestamps[len_per_map * map_idx:len_per_map * (map_idx + 1)] for map_idx in range(self.map_num)]
+            time_diffs = [self._get_time_diff(timestamps[map_idx]) for map_idx in range(self.map_num)]
+            if self.map_num > 1:
+                # transition matrix for between maps
+                map_matrix = msg.map_transitions
 
-        # if len(hists) < 2 or len(trans) != len(hists) - 1 or len(dists) != len(hists) or len(trans) == 0:
-        #     rospy.logwarn("Invalid input sizes for particle filter!")
-        #     return
+            # if len(hists) < 2 or len(trans) != len(hists) - 1 or len(dists) != len(hists) or len(trans) == 0:
+            #     rospy.logwarn("Invalid input sizes for particle filter!")
+            #     return
 
-        if abs(traveled) < 0.001:
-            # this is when odometry is slower than the estimator
-            self.last_time = curr_time
-            # rospy.logwarn(
-            #     "Not enough movement detected for particle filter update!\n" + "traveled: " + str(traveled) + "," + str(
-            #         np.var(curr_img_diff)))
-            return
+            if abs(traveled) < 0.001:
+                # this is when odometry is slower than the estimator
+                self.last_time = curr_time
+                # rospy.logwarn(
+                #     "Not enough movement detected for particle filter update!\n" + "traveled: " + str(traveled) + "," + str(
+                #         np.var(curr_img_diff)))
+                return
 
-        if self.particles.shape[-1] > self.particles_num:
-            self._log.warn("errorneous state - too much particles")
-            self.particles = self.particles[:, :self.particles_num]
+            if self.particles.shape[-1] > self.particles_num:
+                self._log.warn("errorneous state - too much particles")
+                self.particles = self.particles[:, :self.particles_num]
 
-        # motion step
-        for map_idx in range(self.map_num):
-            # get map transition for each particle
-            map_particle_mask = self.particles[2, :] == map_idx
-            # centers of distances
-            mat_dists = np.transpose(np.matrix((dists[map_idx, 1:] + dists[map_idx, :-1]) / 2.0))
-            p_distances = np.matrix(self.particles[0, map_particle_mask])
-            particles_in_map = np.sum(map_particle_mask)
-            # rospy.logwarn(np.argmin(np.abs(mat_dists - p_distances)))
-            closest_transition = np.transpose(np.argmin(np.abs(mat_dists - p_distances), axis=0))
-            traveled_fracs = float(curr_time_diff) / np.array(time_diffs[map_idx])
-            # rospy.loginfo("traveled fracs:" + str(traveled_fracs))
-            # Monte carlo sampling of transitions
-            trans = -self._sample_hist(map_trans[map_idx])
-            trans_per_particle = trans[closest_transition.squeeze(), np.arange(particles_in_map)].transpose()
-            frac_per_particle = traveled_fracs[closest_transition]
-            # generate new particles
-            out = []
-            # rolls = np.random.rand(self.particles.shape[1])
-            # indices = self._first_nonzero(np.matrix(trans_cumsum_per_particle) >= np.transpose(np.matrix(rolls)), 1)
-            trans_diff = np.array(trans_per_particle * frac_per_particle)
-            align_shift = curr_img_diff.transpose()[map_particle_mask] + trans_diff
+            # motion step
+            for map_idx in range(self.map_num):
+                # get map transition for each particle
+                map_particle_mask = self.particles[2, :] == map_idx
+                # centers of distances
+                mat_dists = np.transpose(np.matrix((dists[map_idx, 1:] + dists[map_idx, :-1]) / 2.0))
+                p_distances = np.matrix(self.particles[0, map_particle_mask])
+                particles_in_map = np.sum(map_particle_mask)
+                # rospy.logwarn(np.argmin(np.abs(mat_dists - p_distances)))
+                closest_transition = np.transpose(np.argmin(np.abs(mat_dists - p_distances), axis=0))
+                traveled_fracs = float(curr_time_diff) / np.array(time_diffs[map_idx])
+                # rospy.loginfo("traveled fracs:" + str(traveled_fracs))
+                # Monte carlo sampling of transitions
+                trans = -self._sample_hist(map_trans[map_idx])
+                trans_per_particle = trans[closest_transition.squeeze(), np.arange(particles_in_map)].transpose()
+                frac_per_particle = traveled_fracs[closest_transition]
+                # generate new particles
+                out = []
+                # rolls = np.random.rand(self.particles.shape[1])
+                # indices = self._first_nonzero(np.matrix(trans_cumsum_per_particle) >= np.transpose(np.matrix(rolls)), 1)
+                trans_diff = np.array(trans_per_particle * frac_per_particle)
+                align_shift = curr_img_diff.transpose()[map_particle_mask] + trans_diff
 
-            # debugging
-            # self._log.warn(str(closest_transition))
-            # self._log.warn("map_trans " + str(np.argmax(map_trans[0], axis=-1)))
-            # self._log.warn("live: " + str(np.mean(curr_img_diff)))
-            # self._log.warn("map: " + str(np.mean(trans_diff)))
-            # self._log.warn("curr_time: " + str(curr_time_diff))
-            # self._log.warn("map_time " + str(time_diffs[map_idx]))
+                # debugging
+                # self._log.warn(str(closest_transition))
+                # self._log.warn("map_trans " + str(np.argmax(map_trans[0], axis=-1)))
+                # self._log.warn("live: " + str(np.mean(curr_img_diff)))
+                # self._log.warn("map: " + str(np.mean(trans_diff)))
+                # self._log.warn("curr_time: " + str(curr_time_diff))
+                # self._log.warn("map_time " + str(time_diffs[map_idx]))
 
-            # distance is not shifted because it is shifted already in odometry step
-            particle_shifts = np.concatenate((np.zeros(trans_diff.shape), align_shift), axis=1)
+                # distance is not shifted because it is shifted already in odometry step
+                particle_shifts = np.concatenate((np.zeros(trans_diff.shape), align_shift), axis=1)
 
-            moved_particles = np.transpose(self.particles[:2, map_particle_mask]) + particle_shifts + \
-                              self.rng.normal(
-                                  loc=(0, 0),
-                                  scale=(self.odom_error * traveled, 0),
-                                  size=(particles_in_map, 2)
-                              )
-            out.append(moved_particles)
-            self.particles[:2, map_particle_mask] = moved_particles.transpose()
+                moved_particles = np.transpose(self.particles[:2, map_particle_mask]) + particle_shifts + \
+                                  self.rng.normal(
+                                      loc=(0, 0),
+                                      scale=(self.odom_error * traveled, 0),
+                                      size=(particles_in_map, 2)
+                                  )
+                out.append(moved_particles)
+                self.particles[:2, map_particle_mask] = moved_particles.transpose()
 
-            # TODO: this has to be updated for joint map state
-            if self.use_map_trans and _duration_to_sec(self._clock.now() - self.last_map_transition_time) > self._map_trans_time \
-                    and hists is not None:
-                random_indices = self.rng.choice(np.arange(self.particles_num), int(self.particles_num // 5))
-                random_particles = self.particles[2, random_indices]
-                # move particles in map space, but not too often - time limit
-                self.last_map_transition_time = self._clock.now()
-                for map_id in range(msg.maps[1]):
-                    random_particles[random_particles == map_id] = self.rng.choice(
-                        np.arange(msg.maps[1]),
-                        int(np.sum(random_particles == map_id)),
-                        p=map_matrix[map_id]
+                # TODO: this has to be updated for joint map state
+                if self.use_map_trans and _duration_to_sec(self._clock.now() - self.last_map_transition_time) > self._map_trans_time \
+                        and hists is not None:
+                    random_indices = self.rng.choice(np.arange(self.particles_num), int(self.particles_num // 5))
+                    random_particles = self.particles[2, random_indices]
+                    # move particles in map space, but not too often - time limit
+                    self.last_map_transition_time = self._clock.now()
+                    for map_id in range(msg.maps[1]):
+                        random_particles[random_particles == map_id] = self.rng.choice(
+                            np.arange(msg.maps[1]),
+                            int(np.sum(random_particles == map_id)),
+                            p=map_matrix[map_id]
+                        )
+                    self.particles[2, random_indices] = random_particles
+                    # rospy.logwarn("Motion step finished!")
+
+            # add randomly spawned particles
+            if self.add_rand > 0:
+                new = []
+                tmp = np.zeros((3, int(self.particles_num * self.add_rand)))
+                tmp[0, :] = self.rng.uniform(low=np.mean(dists[:, 0]), high=np.mean(dists[:, -1]),
+                                             size=(1, int(self.particles_num * self.add_rand)))
+                tmp[1, :] = self.rng.uniform(low=-0.5, high=0.5, size=(1, int(self.particles_num * self.add_rand)))
+                tmp[2, :] = np.random.randint(low=0, high=self.map_num, size=(1, int(self.particles_num * self.add_rand)))
+                new.append(tmp.transpose())
+                new.append(self.particles.transpose())
+                self.particles = np.concatenate(new).transpose()
+                if self.particle_prob is not None:
+                    # set the lowest possible probability to all added particles
+                    self.particle_prob = np.concatenate(
+                        [self.particle_prob, np.zeros((self.particles[0].size - self.particles_num), )]
                     )
-                self.particles[2, random_indices] = random_particles
-                # rospy.logwarn("Motion step finished!")
 
-        # add randomly spawned particles
-        if self.add_rand > 0:
-            new = []
-            tmp = np.zeros((3, int(self.particles_num * self.add_rand)))
-            tmp[0, :] = self.rng.uniform(low=np.mean(dists[:, 0]), high=np.mean(dists[:, -1]),
-                                         size=(1, int(self.particles_num * self.add_rand)))
-            tmp[1, :] = self.rng.uniform(low=-0.5, high=0.5, size=(1, int(self.particles_num * self.add_rand)))
-            tmp[2, :] = np.random.randint(low=0, high=self.map_num, size=(1, int(self.particles_num * self.add_rand)))
-            new.append(tmp.transpose())
-            new.append(self.particles.transpose())
-            self.particles = np.concatenate(new).transpose()
-            if self.particle_prob is not None:
-                # set the lowest possible probability to all added particles
-                self.particle_prob = np.concatenate(
-                    [self.particle_prob, np.zeros((self.particles[0].size - self.particles_num), )]
+            # sensor step
+            particle_prob = np.zeros(self.particles.shape[-1])
+            self.particles[1] = np.clip(self.particles[1], -1.0, 1.0)  # more than 0% overlap is nonsense
+            for map_idx in range(self.map_num):
+                map_particle_mask = self.particles[2] == map_idx
+                map_masked_particles = self.particles[:, map_particle_mask]
+
+                interp_f = interpolate.RectBivariateSpline(
+                    dists[map_idx], np.linspace(-1.0, 1.0, hist_width), hists[map_idx], kx=1
                 )
+                particle_prob[map_particle_mask] = interp_f(map_masked_particles[0], map_masked_particles[1], grid=False)
 
-        # sensor step
-        particle_prob = np.zeros(self.particles.shape[-1])
-        self.particles[1] = np.clip(self.particles[1], -1.0, 1.0)  # more than 0% overlap is nonsense
-        for map_idx in range(self.map_num):
-            map_particle_mask = self.particles[2] == map_idx
-            map_masked_particles = self.particles[:, map_particle_mask]
+            self.particle_prob = particle_prob
+            self.particle_prob[self.particle_prob < 0] = 0.0   # lower than 0.0 probability - should not happen though
 
-            interp_f = interpolate.RectBivariateSpline(
-                dists[map_idx], np.linspace(-1.0, 1.0, hist_width), hists[map_idx], kx=1
-            )
-            particle_prob[map_particle_mask] = interp_f(map_masked_particles[0], map_masked_particles[1], grid=False)
+            # perform some normalization and resample the particles via roulette wheel
+            # particle_prob -= particle_prob.min()
+            # particle_prob /= particle_prob.sum()
+            softmaxed_probs = self._numpy_softmax(self.particle_prob, self.BETA_choice)
+            chosen_indices = self.rng.choice(np.shape(self.particles)[1], int(self.particles_num), p=softmaxed_probs)
+            # self._log.warn((self.particles[2, chosen_indices])
+            self.particle_prob = self.particle_prob[chosen_indices]
+            self.particles = self.particles[:, chosen_indices]
 
-        self.particle_prob = particle_prob
-        self.particle_prob[self.particle_prob < 0] = 0.0   # lower than 0.0 probability - should not happen though
+            # publish filtering output ------------------------------------------------------------------
+            self.last_image = msg.live_features
+            self.last_time = curr_time
+            self.traveled_dist = 0.0
+            self._get_coords()  # this updates the values which are published continuously
 
-        # perform some normalization and resample the particles via roulette wheel
-        # particle_prob -= particle_prob.min()
-        # particle_prob /= particle_prob.sum()
-        softmaxed_probs = self._numpy_softmax(self.particle_prob, self.BETA_choice)
-        chosen_indices = self.rng.choice(np.shape(self.particles)[1], int(self.particles_num), p=softmaxed_probs)
-        # self._log.warn((self.particles[2, chosen_indices])
-        self.particle_prob = self.particle_prob[chosen_indices]
-        self.particles = self.particles[:, chosen_indices]
+            #  self._log.warn(np.array((dist_diff, hist_diff)))
+            # visualization & debugging
+            if self.debug:
+                #for
+                particles_out = self.particles.flatten()
+                particles_out = np.concatenate([particles_out, self.coords.flatten()])
+                m = FloatList()
+                m.data = list(particles_out)
+                self.particles_pub.publish(m)
+                self._log.info("Outputted position: " + str(np.mean(self.particles[0, :])) + " +- " + str(np.std(self.particles[0, :])))
+                self._log.info("Outputted alignment: " + str(np.mean(self.particles[1, :])) + " +- " + str(np.std(self.particles[1, :])) + " with transitions: " + str(np.mean(curr_img_diff)))
+                #               + " and " + str(np.mean(trans_diff)))
 
-        # publish filtering output ------------------------------------------------------------------
-        self.last_image = msg.live_features
-        self.last_time = curr_time
-        self.traveled_dist = 0.0
-        self._get_coords()  # this updates the values which are published continuously
-
-        #  self._log.warn(np.array((dist_diff, hist_diff)))
-        # visualization & debugging
-        if self.debug:
-            #for
-            particles_out = self.particles.flatten()
-            particles_out = np.concatenate([particles_out, self.coords.flatten()])
-            m = FloatList()
-            m.data = list(particles_out)
-            self.particles_pub.publish(m)
-            self._log.info("Outputted position: " + str(np.mean(self.particles[0, :])) + " +- " + str(np.std(self.particles[0, :])))
-            self._log.info("Outputted alignment: " + str(np.mean(self.particles[1, :])) + " +- " + str(np.std(self.particles[1, :])) + " with transitions: " + str(np.mean(curr_img_diff)))
-            #               + " and " + str(np.mean(trans_diff)))
-
-            # rospy.logwarn(
-            #     "Finished processing - everything took: " + str((rospy.Time.now() - msg.header.stamp).to_sec()) + " secs")
+                # rospy.logwarn(
+                #     "Finished processing - everything took: " + str((rospy.Time.now() - msg.header.stamp).to_sec()) + " secs")
 
     def _process_rel_distance(self, msg):
         # only increment the distance
         dist = self.rel_dist_est.rel_dist_message_callback(msg)
         if dist is not None and dist >= 0.005:
-            if self.fallback_bearnav:
-                self.distance += dist
-            else:
-                self.particles[0] += dist
-                self._get_coords()
-                self.traveled_dist += dist
+            with self._particle_lock:
+                if self.fallback_bearnav:
+                    self.distance += dist
+                else:
+                    self.particles[0] += dist
+                    self._get_coords()
+                    self.traveled_dist += dist
 
     def _process_abs_distance(self, msg):
         self._log.warn("This function is not available for this fusion class")
@@ -540,13 +543,10 @@ class PF2D(SensorFusion):
         return np.mean(self.particles, axis=1)
 
     def _get_weighted_mean_pos(self, particles, particle_prob):
-        # TODO: this method can yield an error when class variables are changed in process - make copies
+        # Caller must hold self._particle_lock — reads (particles, particle_prob)
+        # which are mutated as a pair by _process_abs_alignment / set_distance.
         align_span = 0.5   # crop of particles to estimate alignment
         predictive = 0.0   # make alignment slightly predictive
-        if np.size(particles[0]) != np.size(particle_prob):
-            particles = particles[:, :self.particles_num]
-            particle_prob = particle_prob[:self.particles_num]
-            self._log.warn("Ommiting particles spawned this round - concurrency issue")
 
         dist = np.sum(particles[0] * particle_prob) / np.sum(particle_prob)
         mask = (particles[0] < (dist + align_span + predictive)) * (particles[0] > (dist - align_span + predictive))
