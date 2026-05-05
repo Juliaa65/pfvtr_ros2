@@ -379,9 +379,6 @@ class MapmakerServer(Node):
         self.distance_img_cb(repr_msg, dist_msg, img)
 
     def distance_img_cb(self, repr_msg: FeaturesList, dist_msg: SensorsOutput, img: Image):
-        if self.img_features is None:
-            self.get_logger().warn("Mapmaker didn't receive the images successfully")
-
         dist = float(dist_msg.output)
         #self.get_logger().warn(f"SYNC CB fired | isMapping={self.isMapping} | dist={dist}")
 
