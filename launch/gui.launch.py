@@ -22,7 +22,7 @@ def generate_launch_description():
     # it from /pfvtr/sensors at startup so the robot is the single source of
     # truth for that semantic config.
     #
-    # `odom_topic` and `camera_topic` ARE launch args, because they are
+    # `odom_topic` and `camera_info_topic` ARE launch args, because they are
     # connection endpoints: the GUI's rate-readiness measurement subscribes
     # to both, and the topic names must match the robot's launch args of
     # the same name. Keeping them in launch files (rather than fetching
@@ -39,13 +39,13 @@ def generate_launch_description():
         ),
     )
 
-    camera_topic = DeclareLaunchArgument(
-        "camera_topic",
+    camera_info_topic = DeclareLaunchArgument(
+        "camera_info_topic",
         default_value="",
         description=(
-            "Camera topic the GUI subscribes to for the rate-readiness "
-            "measurement. Must match the CAMERA INFO topic passed to the robot's "
-            "navigation-stack launch."
+            "CameraInfo topic the GUI subscribes to for the rate-readiness "
+            "measurement. Must match the `camera_info_topic` passed to the "
+            "robot's navigation-stack launch."
         ),
     )
 
@@ -53,7 +53,7 @@ def generate_launch_description():
 
     return LaunchDescription([
         odom_topic,
-        camera_topic,
+        camera_info_topic,
         Node(
             package="pfvtr",
             executable="vtr_gui.py",
@@ -62,7 +62,7 @@ def generate_launch_description():
             respawn=True,
             parameters=[{
                 "odom_topic": lc("odom_topic"),
-                "camera_topic": lc("camera_topic"),
+                "camera_info_topic": lc("camera_info_topic"),
             }],
         ),
     ])

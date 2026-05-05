@@ -21,7 +21,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from rclpy.serialization import deserialize_message
 import rosbag2_py
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import CameraInfo, Image
+from sensor_msgs.msg import CameraInfo
 from rcl_interfaces.srv import SetParameters, GetParameters
 from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 from geometry_msgs.msg import PoseWithCovarianceStamped
@@ -43,14 +43,14 @@ class VTRControlGUI(Node):
             )
             self.navigation_method = "classic"
 
-        # The GUI subscribes to the same `odom_topic` and `camera_topic`
-        # the robot's stack was launched with — both are wired from the
-        # same launch args so they cannot drift. Defaults mirror the
-        # `sensors-ros-2.py` / `representations-ros-2.py` defaults.
+        # The GUI subscribes to `odom_topic` and `camera_info_topic` for the
+        # bringup-readiness check. CameraInfo (not raw Image) is used because
+        # it survives bandwidth-throttled remote-laptop links where Image
+        # frames would be dropped — see commit 2072453 for the original fix.
         self.declare_parameter("odom_topic", "/robot1/odometry")
         self.odom_topic = self.get_parameter("odom_topic").value
-        self.declare_parameter("camera_topic", "/robot1/camera1/image")
-        self.camera_topic = self.get_parameter("camera_topic").value
+        self.declare_parameter("camera_info_topic", "/robot1/camera1/camera_info")
+        self.camera_info_topic = self.get_parameter("camera_info_topic").value
 
         self.mapmaker_client = ActionClient(self, MapMaker, '/pfvtr/mapmaker')
         self.repeater_client = ActionClient(self, MapRepeater, '/pfvtr/repeater')
@@ -655,7 +655,7 @@ class VTRControlGUI(Node):
         hz_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT, durability=DurabilityPolicy.VOLATILE)
         self._odom_sub = self.create_subscription(Odometry, self.odom_topic, self._odom_cb, hz_qos)
         self._repr_sub = self.create_subscription(FeaturesList, '/pfvtr/live_representation', self._repr_cb, hz_qos)
-        self._cam_sub = self.create_subscription(Image, self.camera_topic, self._cam_cb, hz_qos)
+        self._cam_sub = self.create_subscription(CameraInfo, self.camera_info_topic, self._cam_cb, hz_qos)
         self.root.after(int(self.MEASUREMENT_DURATION_S * 1000), self._finish_topic_measurement)
 
     def _odom_cb(self, msg):

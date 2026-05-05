@@ -9,7 +9,13 @@ def generate_launch_description():
     camera_topic = DeclareLaunchArgument(
         "camera_topic",
         default_value="/camera_front_publisher",
-        description="Camera topic name",
+        description="Image topic — consumed by representations / mapmaker / repeater.",
+    )
+
+    camera_info_topic = DeclareLaunchArgument(
+        "camera_info_topic",
+        default_value="/camera_front_publisher/camera_info",
+        description="CameraInfo topic — consumed by vtr_gui for the bringup-readiness check.",
     )
 
     camera_back_topic = DeclareLaunchArgument(
@@ -72,7 +78,7 @@ def generate_launch_description():
 
     navigation_method = DeclareLaunchArgument(
         "navigation_method",
-        default_value="classic",
+        default_value="pf2d",
         description=(
             "Repeat-phase fusion method. "
             "'classic' = Bearnav Classic image-based correction "
@@ -174,7 +180,7 @@ def generate_launch_description():
                     # navigation_method is fetched at runtime from
                     # /pfvtr/sensors — the robot is the source of truth.
                     "odom_topic": lc("odom_topic"),
-                    "camera_topic": lc("camera_topic"),
+                    "camera_info_topic": lc("camera_info_topic"),
                 }],
             ),
         ]
@@ -182,6 +188,7 @@ def generate_launch_description():
 
     return LaunchDescription([
         camera_topic,
+        camera_info_topic,
         camera_back_topic,
         cmd_vel_teleop_output,
         cmd_vel_robot_input,
