@@ -49,6 +49,16 @@ class SensorProcessingNode(Node):
         self.declare_parameter("align_init_std", 1.0)
         self.declare_parameter("choice_beta", 2.5)
         self.declare_parameter("add_random", 0.01)
+        # PF2D output estimator. "kde" picks the dominant mode (correct under
+        # multimodal posteriors). "weighted_mean" is the legacy centroid (drifts
+        # between modes but well-tested in production).
+        self.declare_parameter("position_estimator", "kde")
+        # KDE-peak estimator hyperparameters (only consulted when
+        # position_estimator=="kde", but declared unconditionally so launch
+        # files don't need to know which estimator is active).
+        self.declare_parameter("kde_grid_res", 64)
+        self.declare_parameter("kde_align_span", 0.5)
+        self.declare_parameter("kde_min_align_frac", 0.08)
         self.declare_parameter("matching_type", "siam")
         self.declare_parameter("model_path", "")
         # Repeat-phase fusion class. Two options:
@@ -67,6 +77,15 @@ class SensorProcessingNode(Node):
         align_init_std = float(self.get_parameter("align_init_std").value)
         choice_beta = float(self.get_parameter("choice_beta").value)
         add_random = float(self.get_parameter("add_random").value)
+        position_estimator = self.get_parameter("position_estimator").value
+        if position_estimator not in PF2D.POSITION_ESTIMATORS:
+            raise Exception(
+                f"Invalid position_estimator '{position_estimator}' "
+                f"- must be one of {PF2D.POSITION_ESTIMATORS}"
+            )
+        kde_grid_res = int(self.get_parameter("kde_grid_res").value)
+        kde_align_span = float(self.get_parameter("kde_align_span").value)
+        kde_min_align_frac = float(self.get_parameter("kde_min_align_frac").value)
         matching_type = self.get_parameter("matching_type").value
         model_path = self.get_parameter("model_path").value
         if len(model_path) == 0:
@@ -123,6 +142,10 @@ class SensorProcessingNode(Node):
                 choice_beta=choice_beta,
                 add_random=add_random,
                 debug=True,
+                position_estimator=position_estimator,
+                kde_grid_res=kde_grid_res,
+                kde_align_span=kde_align_span,
+                kde_min_align_frac=kde_min_align_frac,
                 abs_align_est=align_abs,
                 rel_align_est=align_rel,
                 rel_dist_est=dist_rel,

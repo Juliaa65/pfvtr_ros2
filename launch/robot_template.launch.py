@@ -55,6 +55,18 @@ def generate_launch_description():
     model_path = DeclareLaunchArgument("model_path", default_value="")
 
     choice_beta = DeclareLaunchArgument("choice_beta", default_value="2.5")
+    position_estimator = DeclareLaunchArgument(
+        "position_estimator",
+        default_value="kde",
+        description=(
+            "PF2D output estimator. 'kde' picks the dominant mode (default, "
+            "correct under multimodal posteriors). 'weighted_mean' is the legacy "
+            "centroid (drifts between modes but well-tested)."
+        ),
+    )
+    kde_grid_res = DeclareLaunchArgument("kde_grid_res", default_value="64")
+    kde_align_span = DeclareLaunchArgument("kde_align_span", default_value="0.5")
+    kde_min_align_frac = DeclareLaunchArgument("kde_min_align_frac", default_value="0.08")
     matching_type = DeclareLaunchArgument("matching_type", default_value="siam")
     turn_gain = DeclareLaunchArgument("turn_gain", default_value="1.0")
 
@@ -93,6 +105,10 @@ def generate_launch_description():
                     "align_init_std": lc("align_init_std"),
                     "choice_beta": lc("choice_beta"),
                     "add_random": lc("add_random"),
+                    "position_estimator": lc("position_estimator"),
+                    "kde_grid_res": lc("kde_grid_res"),
+                    "kde_align_span": lc("kde_align_span"),
+                    "kde_min_align_frac": lc("kde_min_align_frac"),
                     "matching_type": lc("matching_type"),
                     "model_path": lc("model_path"),
                     "navigation_method": lc("navigation_method"),
@@ -166,6 +182,10 @@ def generate_launch_description():
         add_random,
         model_path,
         choice_beta,
+        position_estimator,
+        kde_grid_res,
+        kde_align_span,
+        kde_min_align_frac,
         matching_type,
         turn_gain,
         navigation_method,

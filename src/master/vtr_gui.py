@@ -21,7 +21,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from rclpy.serialization import deserialize_message
 import rosbag2_py
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import CameraInfo
+from sensor_msgs.msg import CameraInfo, Image
 from rcl_interfaces.srv import SetParameters, GetParameters
 from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 from geometry_msgs.msg import PoseWithCovarianceStamped
@@ -655,7 +655,7 @@ class VTRControlGUI(Node):
         hz_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT, durability=DurabilityPolicy.VOLATILE)
         self._odom_sub = self.create_subscription(Odometry, self.odom_topic, self._odom_cb, hz_qos)
         self._repr_sub = self.create_subscription(FeaturesList, '/pfvtr/live_representation', self._repr_cb, hz_qos)
-        self._cam_sub = self.create_subscription(CameraInfo, self.camera_topic, self._cam_cb, hz_qos)
+        self._cam_sub = self.create_subscription(Image, self.camera_topic, self._cam_cb, hz_qos)
         self.root.after(int(self.MEASUREMENT_DURATION_S * 1000), self._finish_topic_measurement)
 
     def _odom_cb(self, msg):

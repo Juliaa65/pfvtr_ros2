@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import numpy as np
 from scipy import interpolate
+from scipy.stats import gaussian_kde
 import torch as t
 
 import rclpy
@@ -139,6 +140,8 @@ class PF2D(SensorFusion):
     # Second dimension - alignment
     # Third dimension - maps
 
+    POSITION_ESTIMATORS = ("kde", "weighted_mean")
+
     def __init__(
         self,
         node,
@@ -156,6 +159,10 @@ class PF2D(SensorFusion):
         rel_align_est: DisplacementEstimator,
         rel_dist_est: RelativeDistanceEstimator,
         repr_creator: RepresentationsCreator,
+        position_estimator: str = "kde",
+        kde_grid_res: int = 64,
+        kde_align_span: float = 0.5,
+        kde_min_align_frac: float = 0.08,
     ):
         super().__init__(
             node,
@@ -198,6 +205,25 @@ class PF2D(SensorFusion):
 
         self._min_align_noise = 0.01
         self._map_trans_time = 5.0
+
+        # Position estimator dispatch. "kde" picks the dominant mode (correct
+        # under multimodal posteriors); "weighted_mean" is the legacy centroid
+        # estimator (kept as a rollback option, accepts the inter-mode drift
+        # failure mode but is well-tested in production).
+        if position_estimator not in self.POSITION_ESTIMATORS:
+            self._log.warn(
+                f"Invalid position_estimator '{position_estimator}'; "
+                f"falling back to 'kde'. Valid: {self.POSITION_ESTIMATORS}"
+            )
+            position_estimator = "kde"
+        self._position_estimator = position_estimator
+        self._kde_grid_res = int(kde_grid_res)
+        self._kde_align_span = float(kde_align_span)
+        # Fraction of total particles required inside the kde_align_span window
+        # for the 1D alignment KDE to run. Stored as a fraction so the threshold
+        # auto-scales with particles_num. Resolved to an absolute count at use
+        # time via self._kde_min_align_count().
+        self._kde_min_align_frac = float(kde_min_align_frac)
 
         self.BETA_align = align_beta
         self.BETA_choice = choice_beta
@@ -483,13 +509,14 @@ class PF2D(SensorFusion):
         return np.array(np.where(mask.any(axis=axis), mask.argmax(axis=axis), invalid_val))
 
     def _get_coords(self):
-        # TODO: implement better estimate - histogram voting!
-        # coords = np.mean(self.particles, axis=1)
         tmp_particles = self.particles
         if self.particle_prob is not None:
-            self.coords = self._get_weighted_mean_pos(np.copy(self.particles), np.copy(self.particle_prob))
-            # self.coords = self._histogram_voting()
-            # self.coords = self.particles[:2, np.argmax(self.particle_prob)]
+            estimator = (
+                self._get_kde_peak_pos
+                if self._position_estimator == "kde"
+                else self._get_weighted_mean_pos
+            )
+            self.coords = estimator(np.copy(self.particles), np.copy(self.particle_prob))
             if self.one_dim:
                 # for testing not using 2nd dim
                 self.coords[1] = (np.argmax(np.max(self.last_hists, axis=0)) - self.last_hists[0].size // 2) / \
@@ -539,40 +566,69 @@ class PF2D(SensorFusion):
             for idx, curr_trans_sample in enumerate(hists)
         ])
 
-    def _get_mean_pos(self):
-        return np.mean(self.particles, axis=1)
+    def _kde_min_align_count(self):
+        # Absolute particle threshold for the 1D alignment KDE / weighted-mean
+        # fallback. Derived from the fraction so it tracks particles_num.
+        return max(1, int(self._kde_min_align_frac * self.particles_num))
 
     def _get_weighted_mean_pos(self, particles, particle_prob):
         # Caller must hold self._particle_lock — reads (particles, particle_prob)
         # which are mutated as a pair by _process_abs_alignment / set_distance.
-        align_span = 0.5   # crop of particles to estimate alignment
-        predictive = 0.0   # make alignment slightly predictive
-
+        # Legacy centroid estimator: lands between modes when the posterior is
+        # multimodal. Kept as a rollback option behind position_estimator="weighted_mean".
+        align_span = self._kde_align_span
         dist = np.sum(particles[0] * particle_prob) / np.sum(particle_prob)
-        mask = (particles[0] < (dist + align_span + predictive)) * (particles[0] > (dist - align_span + predictive))
-        p_num = np.sum(mask)
-        if p_num < 50:
-            self._log.warn("Only " + str(p_num) + " particles used for alignment estimate - could be very noisy")
-        if np.isnan(particle_prob).any() or np.isnan(particles).any() or np.sum(particle_prob[mask]) == 0.0:
-            self._log.warn("Somehow NaN in particles or probs!")
-            self._log.warn(str(particle_prob[mask]))
-            self._log.warn(str(particles))
-            self._log.warn(str(np.sum(particle_prob[mask])))
+        mask = (particles[0] < (dist + align_span)) & (particles[0] > (dist - align_span))
+        if mask.sum() < self._kde_min_align_count():
+            self._log.warn(
+                "Only " + str(int(mask.sum()))
+                + " particles used for alignment estimate - could be very noisy"
+            )
+        if (np.isnan(particle_prob).any()
+                or np.isnan(particles).any()
+                or np.sum(particle_prob[mask]) == 0.0):
+            self._log.warn("Degenerate particle distribution; using last alignment.")
             return np.array((dist, self.alignment))
-
         align = np.sum(particles[1, mask] * particle_prob[mask]) / np.sum(particle_prob[mask])
         return np.array((dist, align))
-        # weighted_particles = particles[:2] * np.tile(particle_prob, (2, 1))
-        # out = np.sum(weighted_particles, axis=1) / np.sum(particle_prob)
-        # return out
 
-    def _histogram_voting(self):
-        hist, x, y = np.histogram2d(self.particles[0], self.particles[1], bins=20, weights=self.particle_prob)
-        indices = np.unravel_index(np.argmax(hist, axis=None), hist.shape)
-        return np.array([x[indices[0]], y[indices[1]]])
-
-    def _get_median_pos(self):
-        return np.median(self.particles, axis=1)
+    def _get_kde_peak_pos(self, particles, particle_prob):
+        # Caller must hold self._particle_lock — reads (particles, particle_prob)
+        # which are mutated as a pair by _process_abs_alignment / set_distance.
+        # Two-stage estimator: 2D weighted KDE to find the dominant distance mode,
+        # then a 1D KDE in alignment restricted to particles near that distance.
+        if (particle_prob.sum() <= 0
+                or np.isnan(particle_prob).any()
+                or np.isnan(particles).any()):
+            self._log.warn("Degenerate particle distribution; using last alignment.")
+            return np.array((float(np.mean(particles[0])), float(self.alignment)))
+        weights = particle_prob / particle_prob.sum()
+        try:
+            kde = gaussian_kde(particles[:2], weights=weights)
+        except (np.linalg.LinAlgError, ValueError):
+            # singular bandwidth — happens right after set_distance when all
+            # particles share a position before the first odometry perturbation.
+            return np.array((
+                float(np.sum(particles[0] * weights)),
+                float(np.sum(particles[1] * weights)),
+            ))
+        grid_d = np.linspace(particles[0].min(), particles[0].max(), self._kde_grid_res)
+        grid_a = np.linspace(-1.0, 1.0, self._kde_grid_res)
+        DD, AA = np.meshgrid(grid_d, grid_a, indexing="ij")
+        density = kde(np.vstack([DD.ravel(), AA.ravel()])).reshape(DD.shape)
+        i, j = np.unravel_index(np.argmax(density), density.shape)
+        d_peak = float(grid_d[i])
+        mask = (particles[0] > d_peak - self._kde_align_span) & (particles[0] < d_peak + self._kde_align_span)
+        if mask.sum() < self._kde_min_align_count() or particle_prob[mask].sum() <= 0:
+            a_peak = float(grid_a[j])
+        else:
+            w_a = particle_prob[mask] / particle_prob[mask].sum()
+            try:
+                a_kde = gaussian_kde(particles[1, mask], weights=w_a)
+                a_peak = float(grid_a[np.argmax(a_kde(grid_a))])
+            except (np.linalg.LinAlgError, ValueError):
+                a_peak = float(grid_a[j])
+        return np.array((d_peak, a_peak))
 
 
 # class NNPolicy(SensorFusion):
