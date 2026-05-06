@@ -942,40 +942,25 @@ class VTRControlGUI(Node):
             self.log_status(f"ERROR: no /recorded_odometry messages in {bag_dir}")
             return
 
-        # The voxels sim's /recorded_odometry is in raylib axes (Y up),
-        # while the sim's /initialpose subscriber expects ROS REP-103
-        # (Z up).  Translate both position and heading here so the bag's
-        # recorded pose maps to the right teleport destination.
-        rp = odom_msg.pose.pose.position
-        rq = odom_msg.pose.pose.orientation
-
-        # Recover the camera's actual look direction by rotating raylib's
-        # default forward (-Z) with the recorded quaternion, then take the
-        # heading angle in the X-Z floor plane (matches getPlayerAngle's
-        # atan2(z, x) convention).
-        dir_x = -2.0 * (rq.x * rq.z + rq.y * rq.w)
-        dir_z = -(1.0 - 2.0 * (rq.x * rq.x + rq.y * rq.y))
-        heading = math.atan2(dir_z, dir_x)
-
+        # /recorded_odometry is published by the voxels simulator natively in
+        # ROS REP-103 (after the axis-convention cleanup in ros_voxels). The
+        # /initialpose subscriber also expects ROS REP-103, so we just
+        # republish the recorded pose verbatim — no axis swap, no heading
+        # recovery. (Maps recorded *before* the cleanup contain raylib-axes
+        # data and will teleport to the wrong place; re-record them.)
         msg = PoseWithCovarianceStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = "map"
-        # raylib x → ROS x (forward); raylib z (lateral floor) → ROS y;
-        # raylib y is height, dropped (the sim pins height to 0.5 itself).
-        msg.pose.pose.position.x = rp.x
-        msg.pose.pose.position.y = rp.z
-        msg.pose.pose.position.z = 0.0
-        # Re-encode the heading as a +Z-axis quaternion so the simulator's
-        # standard ROS yaw-extraction formula reads it back correctly.
-        msg.pose.pose.orientation.x = 0.0
-        msg.pose.pose.orientation.y = 0.0
-        msg.pose.pose.orientation.z = math.sin(heading / 2.0)
-        msg.pose.pose.orientation.w = math.cos(heading / 2.0)
+        msg.pose.pose = odom_msg.pose.pose
         self.teleport_pub.publish(msg)
 
+        rp = odom_msg.pose.pose.position
+        rq = odom_msg.pose.pose.orientation
+        yaw = math.atan2(2.0 * (rq.w * rq.z + rq.x * rq.y),
+                         1.0 - 2.0 * (rq.y * rq.y + rq.z * rq.z))
         self.log_status(
             f"Teleported to start of '{map_name}': "
-            f"x={rp.x:.2f} y={rp.z:.2f} (raylib z), heading={math.degrees(heading):.1f} deg"
+            f"x={rp.x:.2f} y={rp.y:.2f}, heading={math.degrees(yaw):.1f} deg"
         )
 
     def send_stop_repeat(self):
