@@ -652,7 +652,13 @@ class VTRControlGUI(Node):
         self.repr_count = 0
         self.cam_count = 0
 
-        hz_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT, durability=DurabilityPolicy.VOLATILE)
+        # depth=10 matches the codebase's SYNC_FEEDER_QOS / SYNC_QOS pattern:
+        # high-rate streams need a buffer so the rate count isn't artificially
+        # depressed by transient Tk-induced spin delays. depth=1 (the prior
+        # value) overwrote messages whenever spin_ros lagged behind a single
+        # publish period, producing rate readings well below the actual
+        # publisher rate that `ros2 topic hz` reports.
+        hz_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT, durability=DurabilityPolicy.VOLATILE)
         self._odom_sub = self.create_subscription(Odometry, self.odom_topic, self._odom_cb, hz_qos)
         self._repr_sub = self.create_subscription(FeaturesList, '/pfvtr/live_representation', self._repr_cb, hz_qos)
         self._cam_sub = self.create_subscription(CameraInfo, self.camera_info_topic, self._cam_cb, hz_qos)
