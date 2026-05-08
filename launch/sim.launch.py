@@ -68,7 +68,7 @@ def generate_launch_description():
     kde_align_span = DeclareLaunchArgument("kde_align_span", default_value="0.5")
     kde_min_align_frac = DeclareLaunchArgument("kde_min_align_frac", default_value="0.08")
     matching_type = DeclareLaunchArgument("matching_type", default_value="siam")
-    turn_gain = DeclareLaunchArgument("turn_gain", default_value="0.05")
+    turn_gain = DeclareLaunchArgument("turn_gain", default_value="0.5")
 
     navigation_method = DeclareLaunchArgument(
         "navigation_method",
