@@ -319,8 +319,8 @@ class MapmakerServer(Node):
 
         self.synced_topics = ApproximateTimeSynchronizer(
             [repr_sub, distance_sub, cam_sub],
-            queue_size=10,
-            slop=0.3
+            queue_size=20,
+            slop=0.5
         )
         self.synced_topics.registerCallback(self.distance_img_cb)
 
