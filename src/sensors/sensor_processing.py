@@ -228,10 +228,12 @@ class PF2D(SensorFusion):
         self.BETA_align = align_beta
         self.BETA_choice = choice_beta
 
-        # For debugging
+        # For debugging. Publisher is always created (cheap when no subscribers)
+        # so that toggling `self.debug` at runtime via the sensors-node param
+        # callback is a single attribute flip — no need to allocate a publisher
+        # on the executor thread while a fusion update may be in flight.
         self.debug = debug
-        if debug:
-            self.particles_pub = node.create_publisher(FloatList, "particles", 1)
+        self.particles_pub = node.create_publisher(FloatList, "particles", 1)
 
 
     def set_distance(self, request: SetDist.Request, response: SetDist.Response):
@@ -276,7 +278,8 @@ class PF2D(SensorFusion):
                 curr_idx += 1
         for i in range(map_num):
             transitions[i] = self._numpy_softmax(transitions[i], self.BETA_choice)
-        self._log.warn(str(transitions))
+        if self.debug:
+            self._log.warn(str(transitions))
         return transitions
 
     def _get_time_diff(self, timestamps: list):
@@ -310,7 +313,8 @@ class PF2D(SensorFusion):
             if self.fallback_bearnav:
                 histogram = np.array(msg.map_histograms[0].values).reshape(msg.map_histograms[0].shape)
                 self.alignment = (np.argmax(histogram) - np.size(histogram) // 2) / (np.size(histogram) // 2)
-                self._log.info("Fallback displacement: " + str(self.alignment))
+                if self.debug:
+                    self._log.info("Fallback displacement: " + str(self.alignment))
                 return
 
             hists = np.array(msg.map_histograms[0].values).reshape(msg.map_histograms[0].shape)

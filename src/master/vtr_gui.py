@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 import math
 import random
+import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
 import os
 import glob
+
+import numpy as np
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 # All maps live under this workspace-relative directory.  Resolution happens
 # here; on-the-wire `map_name` (in actions and inside `params`) stays a bare
@@ -27,7 +32,7 @@ from rcl_interfaces.srv import SetParameters, GetParameters
 from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from pfvtr.action import MapMaker, MapRepeater
-from pfvtr.msg import FeaturesList
+from pfvtr.msg import FeaturesList, FloatList
 from pfvtr.srv import GetMaps
 
 
@@ -144,8 +149,10 @@ class VTRControlGUI(Node):
 
         self.actions_tab = ttk.Frame(self.notebook)
         self.control_tab = ttk.Frame(self.notebook)
+        self.particles_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.actions_tab, text="Actions")
         self.notebook.add(self.control_tab, text="Control")
+        self.notebook.add(self.particles_tab, text="Particles")
 
         # Topic-rate frame goes first so it sits at the top of the Actions
         # tab — it gates every other button below it.
@@ -154,6 +161,7 @@ class VTRControlGUI(Node):
         self.setup_repeating_frame(self.actions_tab)
         self.setup_status_bar(self.actions_tab)
         self.setup_control_frame(self.control_tab)
+        self.setup_particles_frame(self.particles_tab)
         # Map list is populated by `_check_stack_ready` once the repeater's
         # GetMaps service is reachable; the Refresh button can be used
         # afterwards to re-fetch.
@@ -181,6 +189,11 @@ class VTRControlGUI(Node):
         # Watches for subscribers on /initialpose and gates teleport buttons
         # accordingly. Runs forever so disconnects also re-disable the buttons.
         self.root.after(500, self._update_teleport_availability)
+
+        # Particle-cloud redraw loop. Runs forever once started; the checkbox
+        # in the Particles tab gates whether each tick does work or just
+        # re-arms.
+        self.root.after(500, self._redraw_particles)
 
         # Periodic ROS2 spinning
         self.root.after(20, self.spin_ros)
@@ -463,6 +476,206 @@ class VTRControlGUI(Node):
         self.teleport_status_var = tk.StringVar(value="")
         ttk.Label(teleport_frame, textvariable=self.teleport_status_var,
                   foreground="blue").grid(row=5, column=0, columnspan=2, sticky='w', pady=(4, 0))
+
+    def setup_particles_frame(self, parent):
+        # Live PF2D particle-cloud viewer. The checkbox is the single user
+        # control: toggling it (a) flips `debug` on /pfvtr/sensors via the
+        # parameter server, which is what unlocks the publish in PF2D, and
+        # (b) creates/destroys the local subscription so no traffic flows on
+        # the wire while the tab is idle. The tab is intentionally not gated
+        # on stack readiness — it's a passive observer that fails gracefully
+        # if the sensors node isn't up yet (the param call returns an error
+        # and the checkbox snaps back).
+        self.particles_viz_var = tk.BooleanVar(value=False)
+        self._particles_sub = None
+        self._latest_particles = None
+        self._particles_lock = threading.Lock()
+        self._particles_status_var = tk.StringVar(value="Visualization off")
+
+        top = ttk.Frame(parent)
+        top.pack(fill='x', padx=10, pady=8)
+
+        ttk.Checkbutton(
+            top, text="Enable visualization",
+            variable=self.particles_viz_var,
+            command=self._toggle_particles_viz,
+        ).pack(side='left')
+        ttk.Label(
+            top, textvariable=self._particles_status_var,
+            foreground="blue"
+        ).pack(side='left', padx=(15, 0))
+
+        fig = Figure(figsize=(5, 4), dpi=90)
+        self._particles_ax = fig.add_subplot(111)
+        self._particles_ax.set_xlabel("Alignment")
+        self._particles_ax.set_ylabel("Distance along path [m]")
+        self._particles_ax.set_xlim(-1.05, 1.05)
+        self._particles_ax.grid(True, alpha=0.3)
+        self._particles_canvas = FigureCanvasTkAgg(fig, master=parent)
+        self._particles_canvas.get_tk_widget().pack(
+            fill='both', expand=True, padx=10, pady=(0, 10)
+        )
+        self._particles_canvas.draw()
+
+    def _toggle_particles_viz(self):
+        # Two-step toggle: change the param (so the publisher actually emits)
+        # and the subscription (so the GUI receives). Both ends matter — on
+        # remote-laptop deployments the wire traffic is the expensive part.
+        on = self.particles_viz_var.get()
+        self._set_debug_param(on)
+        if on:
+            self._subscribe_particles()
+            self._particles_status_var.set("Subscribing... waiting for data")
+        else:
+            self._unsubscribe_particles()
+            self._particles_status_var.set("Visualization off")
+
+    def _set_debug_param(self, value):
+        if not self.sensors_set_param_client.wait_for_service(timeout_sec=1.0):
+            self.log_status(
+                "ERROR: /pfvtr/sensors/set_parameters not available "
+                "(sensors node running?)"
+            )
+            # Snap the checkbox back; param server unreachable.
+            self.root.after(0, lambda v=(not value): self.particles_viz_var.set(v))
+            if value:
+                self._unsubscribe_particles()
+            self._particles_status_var.set("Visualization off")
+            return
+
+        req = SetParameters.Request()
+        p = Parameter()
+        p.name = "debug"
+        p.value = ParameterValue()
+        p.value.type = ParameterType.PARAMETER_BOOL
+        p.value.bool_value = bool(value)
+        req.parameters = [p]
+        future = self.sensors_set_param_client.call_async(req)
+        future.add_done_callback(
+            lambda fut, v=value: self._debug_param_done(fut, v)
+        )
+
+    def _debug_param_done(self, future, requested_value):
+        try:
+            response = future.result()
+        except Exception as exc:
+            self.root.after(
+                0, lambda e=exc, v=requested_value: self._debug_param_failed(
+                    f"call failed: {e}", v
+                )
+            )
+            return
+        if not response.results:
+            self.root.after(
+                0, lambda v=requested_value: self._debug_param_failed("empty result", v)
+            )
+            return
+        result = response.results[0]
+        if not result.successful:
+            self.root.after(
+                0, lambda r=result.reason, v=requested_value:
+                    self._debug_param_failed(r, v)
+            )
+            return
+        self.root.after(
+            0, lambda v=requested_value: self.log_status(f"Sensors debug -> {v}")
+        )
+
+    def _debug_param_failed(self, reason, requested_value):
+        self.log_status(f"Sensors debug param REJECTED: {reason}")
+        # Revert checkbox / subscription so the GUI reflects the param store.
+        self.particles_viz_var.set(not requested_value)
+        if requested_value:
+            self._unsubscribe_particles()
+        self._particles_status_var.set("Visualization off")
+
+    def _subscribe_particles(self):
+        if self._particles_sub is not None:
+            return
+        # Match the publisher's QoS: depth=1, BEST_EFFORT, VOLATILE.
+        qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        # Topic resolves under the *namespace* (/pfvtr), not the node name —
+        # the publisher uses the relative name "particles" from a node at
+        # /pfvtr/sensors, so the resolved topic is /pfvtr/particles.
+        self._particles_sub = self.create_subscription(
+            FloatList, '/pfvtr/particles', self._particles_cb, qos
+        )
+
+    def _unsubscribe_particles(self):
+        if self._particles_sub is not None:
+            self.destroy_subscription(self._particles_sub)
+            self._particles_sub = None
+
+    def _particles_cb(self, msg):
+        # Payload format from sensor_processing.py: flatten(particles) ++
+        # flatten(coords). particles is (3, N), coords is (2,). Store latest
+        # only — the redraw timer pulls.
+        arr = np.asarray(msg.data, dtype=np.float32)
+        if arr.size < 5:
+            return
+        coords = arr[-2:]
+        particles_flat = arr[:-2]
+        if particles_flat.size % 3 != 0:
+            return
+        particles = particles_flat.reshape(3, -1)
+        with self._particles_lock:
+            self._latest_particles = (particles, coords)
+
+    def _redraw_particles(self):
+        # 5 Hz throttled redraw. Re-arm unconditionally so the loop survives
+        # a checkbox-off period and resumes immediately when toggled back on.
+        try:
+            if self.particles_viz_var.get() and self._latest_particles is not None:
+                with self._particles_lock:
+                    particles, coords = self._latest_particles
+                    particles = np.array(particles, copy=True)
+                    coords = np.array(coords, copy=True)
+                ax = self._particles_ax
+                ax.clear()
+                ax.set_xlabel("Alignment")
+                ax.set_ylabel("Distance along path [m]")
+                ax.set_xlim(-1.05, 1.05)
+                ax.grid(True, alpha=0.3)
+                # X = alignment (particles[1]), Y = distance (particles[0]).
+                ax.scatter(
+                    particles[1], particles[0],
+                    c=particles[2], cmap='tab10', s=6, alpha=0.6,
+                    vmin=0, vmax=9,
+                )
+                ax.scatter(
+                    [coords[1]], [coords[0]],
+                    marker='*', s=220, c='red',
+                    edgecolors='black', linewidths=1.0, zorder=5,
+                )
+                # Center the distance axis on the estimate so particles don't
+                # appear to "jump" as the cloud drifts. Half-span is the larger
+                # side from the estimate, padded by 20% so particles never sit
+                # on the edge. Floor at 0.5 m to keep the plot stable when the
+                # cloud is tightly clustered (e.g. just after set_distance).
+                d_est = float(coords[0])
+                d_min = float(np.min(particles[0]))
+                d_max = float(np.max(particles[0]))
+                half_span = max(d_est - d_min, d_max - d_est) * 1.2
+                half_span = max(half_span, 0.5)
+                ax.set_ylim(d_est - half_span, d_est + half_span)
+                n_part = particles.shape[1]
+                n_maps = int(np.max(particles[2])) + 1 if n_part > 0 else 0
+                ax.set_title(
+                    f"N={n_part}  estimate: d={coords[0]:.2f} m, a={coords[1]:+.3f}"
+                )
+                self._particles_canvas.draw_idle()
+                self._particles_status_var.set(
+                    f"Drawing — N={n_part}, maps={n_maps}"
+                )
+        finally:
+            # 10 Hz redraw cap. The actual update rate is bounded by the
+            # publisher (which fires once per PF2D resample, ~camera rate);
+            # picking a faster timer just means we never miss a fresh frame.
+            self.root.after(100, self._redraw_particles)
 
     def _send_teleport(self):
         try:

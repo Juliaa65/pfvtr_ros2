@@ -4,7 +4,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
-from rcl_interfaces.msg import SetParametersResult
+from rcl_interfaces.msg import SetParametersResult, ParameterType
 
 from pfvtr.srv import Alignment
 from sensor_processing import BearnavClassic, PF2D, VisualOnly  # , NNPolicy
@@ -75,6 +75,12 @@ class SensorProcessingNode(Node):
         # user must re-issue a repeat goal so `image_pub` matches the new
         # mode and PF2D's particle cloud is re-seeded via set_distance.
         self.declare_parameter("navigation_method", "classic")
+        # PF2D-only debug switch. Toggleable at runtime via the GUI's Particles
+        # tab (or `ros2 param set /pfvtr/sensors debug true|false`). Gates the
+        # particles-topic publish and a couple of chatty per-update logs in
+        # PF2D. The publisher itself is always created so that toggling debug
+        # is a pure attribute flip without touching ROS handles.
+        self.declare_parameter("debug", False)
 
         # Hoisted onto self.* so _build_repeat_fusion can rebuild the fusion
         # at runtime without re-reading parameters or re-loading the Siamese
@@ -106,7 +112,10 @@ class SensorProcessingNode(Node):
                 f"Invalid navigation_method '{self.navigation_method}' "
                 "- must be 'classic' or 'pf2d'"
             )
-        self.get_logger().info(f"Repeat-phase fusion: navigation_method={self.navigation_method}")
+        self.debug = bool(self.get_parameter("debug").value)
+        self.get_logger().info(
+            f"Repeat-phase fusion: navigation_method={self.navigation_method}, debug={self.debug}"
+        )
 
 
         self.align_abs = None
@@ -177,7 +186,7 @@ class SensorProcessingNode(Node):
                 particles_frac=1,
                 choice_beta=self.choice_beta,
                 add_random=self.add_random,
-                debug=True,
+                debug=self.debug,
                 position_estimator=self.position_estimator,
                 kde_grid_res=self.kde_grid_res,
                 kde_align_span=self.kde_align_span,
@@ -277,27 +286,46 @@ class SensorProcessingNode(Node):
         return subs, srvs
 
     def _on_set_parameters(self, params):
-        # Pre-set callback: only `navigation_method` is runtime-reconfigurable.
-        # Reject any other param. The actual teardown/rebuild is deferred to
-        # a one-shot timer so it runs *after* the parameter store commits and
-        # outside this synchronous callback.
+        # Pre-set callback: `navigation_method` and `debug` are the only
+        # runtime-reconfigurable parameters. Reject any other param.
+        #
+        # `navigation_method` defers the actual teardown/rebuild to a one-shot
+        # timer so it runs *after* the parameter store commits.
+        # `debug` is just a single-attribute flip — applied synchronously,
+        # propagated to the live fusion if it has a `debug` slot (PF2D does;
+        # BearnavClassic doesn't).
         for p in params:
-            if p.name != "navigation_method":
+            if p.name == "navigation_method":
+                new_value = p.value
+                if new_value not in ("classic", "pf2d"):
+                    return SetParametersResult(
+                        successful=False,
+                        reason=f"navigation_method must be 'classic' or 'pf2d', got '{new_value}'"
+                    )
+                if new_value == self.navigation_method:
+                    continue  # no-op
+                self._pending_navigation_method = new_value
+                if self._swap_timer is None:
+                    self._swap_timer = self.create_timer(0.0, self._do_swap_navigation_method)
+            elif p.name == "debug":
+                if p.type_ != ParameterType.PARAMETER_BOOL:
+                    return SetParametersResult(
+                        successful=False,
+                        reason=f"debug must be a bool, got type {p.type_}"
+                    )
+                new_debug = bool(p.value)
+                self.debug = new_debug
+                # Propagate to the live repeat fusion. BearnavClassic has no
+                # `debug` attribute; using setattr (with hasattr guard) keeps
+                # this resilient if a future fusion class also lacks the slot.
+                if hasattr(self.repeat_fusion, "debug"):
+                    self.repeat_fusion.debug = new_debug
+                self.get_logger().info(f"debug -> {new_debug}")
+            else:
                 return SetParametersResult(
                     successful=False,
                     reason=f"{p.name} cannot be changed at runtime (sensors node)"
                 )
-            new_value = p.value
-            if new_value not in ("classic", "pf2d"):
-                return SetParametersResult(
-                    successful=False,
-                    reason=f"navigation_method must be 'classic' or 'pf2d', got '{new_value}'"
-                )
-            if new_value == self.navigation_method:
-                continue  # no-op
-            self._pending_navigation_method = new_value
-            if self._swap_timer is None:
-                self._swap_timer = self.create_timer(0.0, self._do_swap_navigation_method)
         return SetParametersResult(successful=True)
 
     def _do_swap_navigation_method(self):
