@@ -327,6 +327,24 @@ class PF2D(SensorFusion):
 
             # Divide incoming data according the map affiliation
             trans_per_map = len_per_map - 1
+            # Defensive: at end-of-repeat the repeater can publish a SensorsInput
+            # whose map_transitions row count doesn't match (len_per_map - 1) *
+            # map_num. Without this guard the mismatch surfaces as an IndexError
+            # on the `trans[closest_transition.squeeze(), ...]` access below,
+            # crashing the sensors node and dropping all PF state. Skip the
+            # update gracefully — the next message arrives within ~50 ms and
+            # the filter tolerates dropped updates the same way it tolerates
+            # the `abs(traveled) < 0.001` short-circuit further down.
+            expected_trans_rows = trans_per_map * self.map_num
+            if map_trans.shape[0] != expected_trans_rows:
+                self._log.warn(
+                    f"PF2D abs_alignment skipped: map_trans has "
+                    f"{map_trans.shape[0]} rows but expected {expected_trans_rows} "
+                    f"(len_per_map={len_per_map}, map_num={self.map_num}). "
+                    "Most likely end-of-repeat publisher race; ignoring this update."
+                )
+                self.last_time = curr_time
+                return
             if len(dists) % msg.map_num > 0:
                 # TODO: this assumes that there is same number of features comming from all the maps (this does not have to hold when 2*map_len < lookaround)
                 # however the mapmaker was updated so that the new maps should have always the same number of images, unless some major error occurs

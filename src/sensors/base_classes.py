@@ -308,13 +308,23 @@ class SensorFusion(ABC):
 
 
     def set_distance(self, request: SetDist.Request, response: SetDist.Response):
-        self.distance = request.dist
+        # Order matters: initialise the dependent estimators FIRST, then
+        # publish `self.distance` last. The wrappers in `process_abs_distance`
+        # and `process_prob_distance` gate on `self.distance is not None` and
+        # then call `abs_dist_est.abs_dist_message_callback` /
+        # `prob_dist_est.prob_dist_message_callback`, which raise "The
+        # distance must be set first" if the estimator hasn't been seeded
+        # yet. With the previous order, an in-flight odom callback (running
+        # on a different executor thread under MultiThreadedExecutor) could
+        # pass the gate but find the estimator still None and kill the node.
+        # Setting the gate value last closes that window.
+        if self.abs_dist_est is not None:
+            self.abs_dist_est.set_dist(request.dist)
+        if self.prob_dist_est is not None:
+            self.prob_dist_est.set_dist(request.dist)
         self.distance_std = 0.0
         self.map = getattr(request, 'map_num', 0)
-        if self.abs_dist_est is not None:
-            self.abs_dist_est.set_dist(self.distance)
-        if self.prob_dist_est is not None:
-            self.prob_dist_est.set_dist(self.distance)
+        self.distance = request.dist
         self.publish_dist()
         return response
 

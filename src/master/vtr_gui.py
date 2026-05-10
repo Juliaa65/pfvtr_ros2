@@ -83,6 +83,13 @@ class VTRControlGUI(Node):
         self.sensors_get_param_client = self.create_client(
             GetParameters, '/pfvtr/sensors/get_parameters'
         )
+        # navigation_method is the only sensors-node parameter that's
+        # runtime-reconfigurable; the switch button on the Repeating tab uses
+        # this client to push the new value, and the sensors node's param
+        # callback handles the actual fusion teardown/rebuild.
+        self.sensors_set_param_client = self.create_client(
+            SetParameters, '/pfvtr/sensors/set_parameters'
+        )
         # /initialpose is the rviz "2D Pose Estimate" topic.  The voxels
         # simulator subscribes to it and teleports the robot to the given
         # x, y, yaw (yaw extracted from the quaternion).
@@ -229,12 +236,32 @@ class VTRControlGUI(Node):
     def setup_repeating_frame(self, parent):
         repeating_frame = ttk.LabelFrame(parent, text="Repeating Controls", padding=10)
         repeating_frame.pack(fill='x', padx=10, pady=5)
-        
+
+        # Navigation method switch sits at the top because it changes the
+        # semantics of every other field below it (image_pub constraint
+        # flips between 0 and >=1). One click swaps the robot's
+        # `self.repeat_fusion` between BearnavClassic and PF2D via
+        # /pfvtr/sensors/set_parameters; on success the UI restyles the
+        # image_pub widget to match.
+        method_row = ttk.Frame(repeating_frame)
+        method_row.grid(row=0, column=0, columnspan=2, sticky='w', pady=(0, 4))
+        ttk.Label(method_row, text="Method:").pack(side='left', padx=(0, 5))
+        self.method_state_var = tk.StringVar(value=self.navigation_method)
+        ttk.Label(method_row, textvariable=self.method_state_var,
+                  foreground="blue", width=10).pack(side='left', padx=(0, 10))
+        self.method_switch_btn = ttk.Button(
+            method_row, text="...", width=18,
+            command=self._switch_navigation_method, state='disabled',
+        )
+        self.method_switch_btn.pack(side='left')
+        self._gated_widgets.append(self.method_switch_btn)
+        self._update_method_switch_label()
+
         # Map name with dropdown
-        ttk.Label(repeating_frame, text="Map Name:").grid(row=0, column=0, sticky='w', pady=2)
-        
+        ttk.Label(repeating_frame, text="Map Name:").grid(row=1, column=0, sticky='w', pady=2)
+
         map_select_frame = ttk.Frame(repeating_frame)
-        map_select_frame.grid(row=0, column=1, sticky='w', pady=2)
+        map_select_frame.grid(row=1, column=1, sticky='w', pady=2)
         
         self.repeat_map_name_var = tk.StringVar()
         self.map_combobox = ttk.Combobox(map_select_frame, textvariable=self.repeat_map_name_var,
@@ -250,7 +277,7 @@ class VTRControlGUI(Node):
         # launch params) and adds it to the map's start pose, so the user
         # can stress-test repeats from non-canonical initial conditions.
         teleport_row = ttk.Frame(repeating_frame)
-        teleport_row.grid(row=1, column=0, columnspan=2, sticky='w', pady=2)
+        teleport_row.grid(row=2, column=0, columnspan=2, sticky='w', pady=2)
         self.teleport_to_map_btn = ttk.Button(
             teleport_row, text="Teleport", width=10,
             command=self._teleport_to_map_start, state='disabled',
@@ -270,28 +297,28 @@ class VTRControlGUI(Node):
         ).pack(side='left', padx=5)
 
         # Start position
-        ttk.Label(repeating_frame, text="Start Position:").grid(row=2, column=0, sticky='w', pady=2)
+        ttk.Label(repeating_frame, text="Start Position:").grid(row=3, column=0, sticky='w', pady=2)
         self.start_pos_var = tk.StringVar(value="0.0")
-        ttk.Entry(repeating_frame, textvariable=self.start_pos_var, width=15).grid(row=2, column=1, sticky='w', pady=2)
+        ttk.Entry(repeating_frame, textvariable=self.start_pos_var, width=15).grid(row=3, column=1, sticky='w', pady=2)
 
         # End position
-        ttk.Label(repeating_frame, text="End Position:").grid(row=3, column=0, sticky='w', pady=2)
+        ttk.Label(repeating_frame, text="End Position:").grid(row=4, column=0, sticky='w', pady=2)
         self.end_pos_var = tk.StringVar(value="0.0")
-        ttk.Entry(repeating_frame, textvariable=self.end_pos_var, width=15).grid(row=3, column=1, sticky='w', pady=2)
+        ttk.Entry(repeating_frame, textvariable=self.end_pos_var, width=15).grid(row=4, column=1, sticky='w', pady=2)
 
         # Traversals
-        ttk.Label(repeating_frame, text="Traversals:").grid(row=4, column=0, sticky='w', pady=2)
+        ttk.Label(repeating_frame, text="Traversals:").grid(row=5, column=0, sticky='w', pady=2)
         self.traversals_var = tk.StringVar(value="1")
-        ttk.Entry(repeating_frame, textvariable=self.traversals_var, width=5).grid(row=4, column=1, sticky='w', pady=2)
+        ttk.Entry(repeating_frame, textvariable=self.traversals_var, width=5).grid(row=5, column=1, sticky='w', pady=2)
 
         # Checkboxes
         self.null_cmd_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(repeating_frame, text="Null Commands",
-                       variable=self.null_cmd_var).grid(row=5, column=0, columnspan=2, sticky='w', pady=2)
+                       variable=self.null_cmd_var).grid(row=6, column=0, columnspan=2, sticky='w', pady=2)
 
         self.use_dist_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(repeating_frame, text="Use Distance-Based Navigation",
-                       variable=self.use_dist_var).grid(row=6, column=0, columnspan=2, sticky='w', pady=2)
+                       variable=self.use_dist_var).grid(row=7, column=0, columnspan=2, sticky='w', pady=2)
 
         # Image publish mode — constraint depends on the navigation_method
         # the robot is running: classic requires 0, pf2d requires >= 1.
@@ -306,17 +333,17 @@ class VTRControlGUI(Node):
             image_pub_default = "1"
             image_pub_state = "normal"
         self.image_pub_label = ttk.Label(repeating_frame, text=image_pub_label)
-        self.image_pub_label.grid(row=7, column=0, sticky='w', pady=2)
+        self.image_pub_label.grid(row=8, column=0, sticky='w', pady=2)
         self.image_pub_var = tk.StringVar(value=image_pub_default)
         self.image_pub_entry = ttk.Entry(repeating_frame, textvariable=self.image_pub_var,
                                          width=5, state=image_pub_state)
-        self.image_pub_entry.grid(row=7, column=1, sticky='w', pady=2)
+        self.image_pub_entry.grid(row=8, column=1, sticky='w', pady=2)
 
         # Send / Stop buttons.  STOP is not in `_gated_widgets` because it
         # has its own state machine driven by goal acceptance / completion,
         # mirroring how STOP MAPPING is handled.
         repeat_btn_frame = ttk.Frame(repeating_frame)
-        repeat_btn_frame.grid(row=8, column=0, columnspan=2, pady=10)
+        repeat_btn_frame.grid(row=9, column=0, columnspan=2, pady=10)
         self.send_repeat_btn = ttk.Button(repeat_btn_frame, text="SEND REPEAT COMMAND",
                                           command=self.send_repeating_goal,
                                           state='disabled')
@@ -604,6 +631,11 @@ class VTRControlGUI(Node):
 
     def _apply_navigation_method(self, method):
         if method == self.navigation_method:
+            # Even on no-op make sure the switch widgets reflect reality
+            # (handles the first sync after startup when navigation_method
+            # already happens to match the local default).
+            self.method_state_var.set(method)
+            self._update_method_switch_label()
             return
         self.navigation_method = method
         if method == "classic":
@@ -614,7 +646,80 @@ class VTRControlGUI(Node):
             self.image_pub_label.config(text="Image Publish Mode (pf2d: ≥1):")
             self.image_pub_var.set("1")
             self.image_pub_entry.config(state="normal")
+        self.method_state_var.set(method)
+        self._update_method_switch_label()
         self.log_status(f"navigation_method synced from robot: {method}")
+
+    def _update_method_switch_label(self):
+        # The button always advertises the *other* mode, so a click is a
+        # toggle. The label next to it (`method_state_var`) shows the
+        # current state.
+        other = "pf2d" if self.navigation_method == "classic" else "classic"
+        self.method_switch_btn.config(text=f"Switch to {other}")
+
+    def _switch_navigation_method(self):
+        target = "pf2d" if self.navigation_method == "classic" else "classic"
+        if not self.sensors_set_param_client.wait_for_service(timeout_sec=1.0):
+            self.log_status(
+                "ERROR: /pfvtr/sensors/set_parameters not available "
+                "(sensors node running?)"
+            )
+            return
+
+        req = SetParameters.Request()
+        param = Parameter()
+        param.name = "navigation_method"
+        param.value = ParameterValue()
+        param.value.type = ParameterType.PARAMETER_STRING
+        param.value.string_value = target
+        req.parameters = [param]
+
+        self.method_switch_btn['state'] = 'disabled'
+        self.log_status(
+            f"Requesting navigation_method swap: {self.navigation_method} -> {target}"
+        )
+        future = self.sensors_set_param_client.call_async(req)
+        future.add_done_callback(
+            lambda fut, t=target: self._method_switch_done(fut, t)
+        )
+
+    def _method_switch_done(self, future, target):
+        try:
+            response = future.result()
+        except Exception as exc:
+            self.root.after(
+                0, lambda e=exc: self._method_switch_failed(f"call failed: {e}")
+            )
+            return
+        if not response.results:
+            self.root.after(
+                0, lambda: self._method_switch_failed("empty result")
+            )
+            return
+        result = response.results[0]
+        if not result.successful:
+            self.root.after(
+                0, lambda r=result.reason: self._method_switch_failed(r)
+            )
+            return
+        self.root.after(0, lambda t=target: self._method_switch_succeeded(t))
+
+    def _method_switch_succeeded(self, target):
+        self.log_status(
+            f"navigation_method swapped to '{target}'. Re-issue your repeat "
+            "goal so image_pub matches the new mode and PF2D's particles "
+            "are re-seeded."
+        )
+        # `_apply_navigation_method` updates self.navigation_method, the
+        # image_pub widget, the state label, and the switch button label.
+        self._apply_navigation_method(target)
+        if self._stack_ready and self._topics_ready:
+            self.method_switch_btn['state'] = 'normal'
+
+    def _method_switch_failed(self, reason):
+        self.log_status(f"navigation_method swap REJECTED: {reason}")
+        if self._stack_ready and self._topics_ready:
+            self.method_switch_btn['state'] = 'normal'
 
     def _initial_gains_done(self, future):
         try:
