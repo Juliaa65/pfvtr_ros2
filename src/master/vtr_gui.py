@@ -429,15 +429,53 @@ class VTRControlGUI(Node):
         self.velocity_gain_btn.grid(row=1, column=2, sticky='w', pady=4)
         self._gated_widgets.append(self.velocity_gain_btn)
 
+        ttk.Label(controller_frame, text="constant_velocity:").grid(row=2, column=0, sticky='w', pady=4)
+        self.constant_velocity_var = tk.StringVar(value="0.0")
+        ttk.Entry(controller_frame, textvariable=self.constant_velocity_var, width=10).grid(
+            row=2, column=1, sticky='w', pady=4, padx=5
+        )
+        self.constant_velocity_btn = ttk.Button(
+            controller_frame, text="Apply",
+            command=lambda: self._apply_controller_param(
+                "constant_velocity", self.constant_velocity_var.get()),
+            state='disabled',
+        )
+        self.constant_velocity_btn.grid(row=2, column=2, sticky='w', pady=4)
+        self._gated_widgets.append(self.constant_velocity_btn)
+        ttk.Label(
+            controller_frame,
+            text="0.0 = use mapped velocity × gain; non-zero = constant linear.x [m/s]",
+            foreground="gray",
+        ).grid(row=3, column=0, columnspan=3, sticky='w', pady=(0, 2))
+
+        ttk.Label(controller_frame, text="decel_distance:").grid(row=4, column=0, sticky='w', pady=4)
+        self.decel_distance_var = tk.StringVar(value="1.0")
+        ttk.Entry(controller_frame, textvariable=self.decel_distance_var, width=10).grid(
+            row=4, column=1, sticky='w', pady=4, padx=5
+        )
+        self.decel_distance_btn = ttk.Button(
+            controller_frame, text="Apply",
+            command=lambda: self._apply_controller_param(
+                "decel_distance", self.decel_distance_var.get()),
+            state='disabled',
+        )
+        self.decel_distance_btn.grid(row=4, column=2, sticky='w', pady=4)
+        self._gated_widgets.append(self.decel_distance_btn)
+        ttk.Label(
+            controller_frame,
+            text="Ramp linear.x and angular.z to zero within this distance [m] of map end. ≤0 disables.",
+            foreground="gray",
+        ).grid(row=5, column=0, columnspan=3, sticky='w', pady=(0, 2))
+
         ttk.Label(
             controller_frame,
             text="Sets parameters live on /pfvtr/controller via SetParameters service.",
             foreground="gray",
-        ).grid(row=2, column=0, columnspan=3, sticky='w', pady=(8, 0))
+        ).grid(row=6, column=0, columnspan=3, sticky='w', pady=(8, 0))
 
         self.control_status_var = tk.StringVar(value="")
         ttk.Label(controller_frame, textvariable=self.control_status_var,
-                  foreground="blue").grid(row=3, column=0, columnspan=3, sticky='w', pady=(4, 0))
+                  foreground="blue").grid(row=7, column=0, columnspan=3, sticky='w', pady=(4, 0))
 
         teleport_frame = ttk.LabelFrame(parent, text="Robot Teleport (voxels sim)", padding=10)
         teleport_frame.pack(fill='x', padx=10, pady=5)
@@ -807,7 +845,7 @@ class VTRControlGUI(Node):
             return
 
         req = GetParameters.Request()
-        req.names = ["turn_gain", "velocity_gain"]
+        req.names = ["turn_gain", "velocity_gain", "constant_velocity", "decel_distance"]
         future = self.controller_get_param_client.call_async(req)
         future.add_done_callback(self._initial_gains_done)
 
@@ -940,14 +978,21 @@ class VTRControlGUI(Node):
         except Exception as exc:
             self.log_status(f"Could not fetch initial controller gains: {exc}")
             return
-        if len(response.values) < 2:
+        if len(response.values) < 4:
             self.log_status("Initial gains response had unexpected length; keeping defaults")
             return
         turn = response.values[0].double_value
         vel = response.values[1].double_value
+        const_v = response.values[2].double_value
+        decel = response.values[3].double_value
         self.turn_gain_var.set(f"{turn}")
         self.velocity_gain_var.set(f"{vel}")
-        msg = f"Loaded initial gains: turn_gain={turn} velocity_gain={vel}"
+        self.constant_velocity_var.set(f"{const_v}")
+        self.decel_distance_var.set(f"{decel}")
+        msg = (
+            f"Loaded initial gains: turn_gain={turn} velocity_gain={vel} "
+            f"constant_velocity={const_v} decel_distance={decel}"
+        )
         self.log_status(msg)
         self.control_status_var.set(msg)
 

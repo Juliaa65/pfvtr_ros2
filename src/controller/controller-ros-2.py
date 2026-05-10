@@ -6,6 +6,7 @@ from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rcl_interfaces.msg import SetParametersResult
 
 from geometry_msgs.msg import Twist, TwistStamped
+from std_msgs.msg import Float32
 from pfvtr.msg import SensorsOutput
 from pfvtr.srv import SetClockGain
 import controller
@@ -30,6 +31,13 @@ class ControllerNode(Node):
         self.declare_parameter("use_uncertainty", True)
         self.declare_parameter("turn_gain", 1.0)
         self.declare_parameter("velocity_gain", 1.0)
+        # Constant linear.x override: 0.0 disables, non-zero commands a fixed
+        # forward speed regardless of the recorded velocity profile.
+        self.declare_parameter("constant_velocity", 0.0)
+        # Linear ramp distance (m) for end-of-map deceleration. Within this
+        # distance to map end, linear.x and angular.z are scaled by
+        # remaining/decel_distance. <=0 disables the ramp.
+        self.declare_parameter("decel_distance", 1.0)
 
         cmd_vel_topic = self.get_parameter("cmd_vel_topic").value
         cb_group = get_exclusive_callback_group()
@@ -38,6 +46,14 @@ class ControllerNode(Node):
 
         self.sub_vel = self.create_subscription(TwistStamped, "map_vel", self.callbackVel, NAVIGATION_QOS, callback_group=cb_group)
         self.sub_corr = self.create_subscription(SensorsOutput, "repeat/output_align", self.callbackCorr, NAVIGATION_QOS, callback_group=cb_group)
+        # Distance from current PF estimate to map end, published by the
+        # repeater. Drives the end-of-map deceleration ramp inside
+        # controller.process().
+        self.sub_remaining = self.create_subscription(
+            Float32, "repeat/distance_remaining",
+            self.callbackDistanceRemaining, NAVIGATION_QOS,
+            callback_group=cb_group,
+        )
 
         self.gain_client = self.create_client(SetClockGain, "set_clock_gain")
         self._apply_controller_params()
@@ -60,17 +76,24 @@ class ControllerNode(Node):
             "turn_gain", self.get_parameter("turn_gain").value))
         use_uncertainty = bool(overrides.get(
             "use_uncertainty", self.get_parameter("use_uncertainty").value))
+        constant_velocity = float(overrides.get(
+            "constant_velocity", self.get_parameter("constant_velocity").value))
+        decel_distance = float(overrides.get(
+            "decel_distance", self.get_parameter("decel_distance").value))
 
         if hasattr(self.c, "reconfig"):
             self.c.reconfig({
                 "velocity_gain": velocity_gain,
                 "turn_gain": turn_gain,
-                "use_uncertainty": use_uncertainty
+                "use_uncertainty": use_uncertainty,
+                "constant_velocity": constant_velocity,
+                "decel_distance": decel_distance,
             })
 
         self.get_logger().warn(
             f"Controller params applied: turn_gain={turn_gain} "
-            f"velocity_gain={velocity_gain} use_uncertainty={use_uncertainty}"
+            f"velocity_gain={velocity_gain} use_uncertainty={use_uncertainty} "
+            f"constant_velocity={constant_velocity} decel_distance={decel_distance}"
         )
 
         self._set_clock_gain_from_velocity(velocity_gain)
@@ -88,12 +111,15 @@ class ControllerNode(Node):
     def callbackCorr(self, msg: SensorsOutput):
         self.c.correction(msg)
 
+    def callbackDistanceRemaining(self, msg: Float32):
+        self.c.set_distance_remaining(msg.data)
+
     def callbackReconfigure(self, params):
         overrides = {}
         for p in params:
             if p.name == "cmd_vel_topic":
                 return SetParametersResult(successful=False, reason="cmd_vel_topic cannot be changed at runtime")
-            if p.name in ("velocity_gain", "turn_gain"):
+            if p.name in ("velocity_gain", "turn_gain", "constant_velocity", "decel_distance"):
                 overrides[p.name] = float(p.value)
             elif p.name == "use_uncertainty":
                 overrides[p.name] = bool(p.value)

@@ -19,6 +19,7 @@ import rosbag2_py
 
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import Twist, TwistStamped
+from std_msgs.msg import Float32
 
 from cv_bridge import CvBridge
 
@@ -153,7 +154,16 @@ class RepeaterServer(Node):
         self.map_publish_span = 1
         self.map_transitions = []
         self.use_distances = False
-        self.distance_finish_offset = 0.2
+        # Tolerance (m) for the goal-success trigger: the action succeeds once
+        # `curr_dist >= map_end - distance_finish_offset`. The end-of-map
+        # deceleration ramp in the controller is what produces the smooth
+        # stop; this is just the slack that compensates for PF estimate
+        # jitter so the success check is reachable. Was 0.2 m before the
+        # controller-side ramp existed.
+        self.declare_parameter("distance_finish_offset", 0.05)
+        self.distance_finish_offset = float(
+            self.get_parameter("distance_finish_offset").value
+        )
         self.curr_map = 0
         self.map_num = 0
         self.last_map = 0
@@ -190,6 +200,13 @@ class RepeaterServer(Node):
 
         self.joy_topic = "map_vel"
         self.joy_pub = self.create_publisher(TwistStamped, self.joy_topic, NAVIGATION_QOS)
+
+        # Live distance from the PF estimate to the end of the active map.
+        # The controller subscribes to this and uses it to ramp linear.x +
+        # angular.z toward zero as the robot approaches the goal.
+        self.distance_remaining_pub = self.create_publisher(
+            Float32, "repeat/distance_remaining", NAVIGATION_QOS
+        )
 
 
         self._action_server = ActionServer(
@@ -304,6 +321,17 @@ class RepeaterServer(Node):
 
         self.curr_dist = msg.output
         self.curr_map = msg.map
+
+        # Publish remaining distance to map end so the controller can ramp
+        # commanded velocity toward zero. Done *before* the finish check so
+        # the controller gets an accurate near-zero value on the very tick
+        # that triggers success.
+        if self.use_distances and len(self.map_distances) > self.curr_map:
+            remaining_msg = Float32()
+            remaining_msg.data = float(
+                self.map_distances[self.curr_map][-1] - self.curr_dist
+            )
+            self.distance_remaining_pub.publish(remaining_msg)
 
         if (self.curr_dist >= (
                 self.map_distances[self.curr_map][-1] - self.distance_finish_offset) and self.use_distances) or \
