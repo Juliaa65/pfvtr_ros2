@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import math
+import random
 import tkinter as tk
 from tkinter import ttk, messagebox
 import os
@@ -51,6 +52,17 @@ class VTRControlGUI(Node):
         self.odom_topic = self.get_parameter("odom_topic").value
         self.declare_parameter("camera_info_topic", "/robot1/camera1/camera_info")
         self.camera_info_topic = self.get_parameter("camera_info_topic").value
+
+        # Symmetric ± spans for the "Displace" checkbox next to the map-start
+        # teleport button: when checked, a random offset uniformly drawn from
+        # [-span, +span] is added to the map's start pose. Useful for stress-
+        # testing PF/repeat from non-canonical initial conditions.
+        self.declare_parameter("displace_x_span", 2.0)
+        self.declare_parameter("displace_y_span", 2.0)
+        self.declare_parameter("displace_yaw_span_deg", 20.0)
+        self.displace_x_span = float(self.get_parameter("displace_x_span").value)
+        self.displace_y_span = float(self.get_parameter("displace_y_span").value)
+        self.displace_yaw_span_deg = float(self.get_parameter("displace_yaw_span_deg").value)
 
         self.mapmaker_client = ActionClient(self, MapMaker, '/pfvtr/mapmaker')
         self.repeater_client = ActionClient(self, MapRepeater, '/pfvtr/repeater')
@@ -233,37 +245,54 @@ class VTRControlGUI(Node):
                                 command=self.refresh_maps_list)
         refresh_btn.pack(side='left', padx=5)
 
+        # Teleport-to-map-start sits directly below the map list. The
+        # "Displace" checkbox draws a random ±span offset (configured via
+        # launch params) and adds it to the map's start pose, so the user
+        # can stress-test repeats from non-canonical initial conditions.
+        teleport_row = ttk.Frame(repeating_frame)
+        teleport_row.grid(row=1, column=0, columnspan=2, sticky='w', pady=2)
         self.teleport_to_map_btn = ttk.Button(
-            map_select_frame, text="Teleport", width=10,
+            teleport_row, text="Teleport", width=10,
             command=self._teleport_to_map_start, state='disabled',
         )
-        self.teleport_to_map_btn.pack(side='left', padx=5)
+        self.teleport_to_map_btn.pack(side='left', padx=(0, 5))
         self._teleport_widgets.append(self.teleport_to_map_btn)
-        
+
+        self.displace_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            teleport_row,
+            text=(
+                f"Displace (±{self.displace_x_span:g} m, "
+                f"±{self.displace_y_span:g} m, "
+                f"±{self.displace_yaw_span_deg:g}°)"
+            ),
+            variable=self.displace_var,
+        ).pack(side='left', padx=5)
+
         # Start position
-        ttk.Label(repeating_frame, text="Start Position:").grid(row=1, column=0, sticky='w', pady=2)
+        ttk.Label(repeating_frame, text="Start Position:").grid(row=2, column=0, sticky='w', pady=2)
         self.start_pos_var = tk.StringVar(value="0.0")
-        ttk.Entry(repeating_frame, textvariable=self.start_pos_var, width=15).grid(row=1, column=1, sticky='w', pady=2)
-        
+        ttk.Entry(repeating_frame, textvariable=self.start_pos_var, width=15).grid(row=2, column=1, sticky='w', pady=2)
+
         # End position
-        ttk.Label(repeating_frame, text="End Position:").grid(row=2, column=0, sticky='w', pady=2)
+        ttk.Label(repeating_frame, text="End Position:").grid(row=3, column=0, sticky='w', pady=2)
         self.end_pos_var = tk.StringVar(value="0.0")
-        ttk.Entry(repeating_frame, textvariable=self.end_pos_var, width=15).grid(row=2, column=1, sticky='w', pady=2)
-        
+        ttk.Entry(repeating_frame, textvariable=self.end_pos_var, width=15).grid(row=3, column=1, sticky='w', pady=2)
+
         # Traversals
-        ttk.Label(repeating_frame, text="Traversals:").grid(row=3, column=0, sticky='w', pady=2)
+        ttk.Label(repeating_frame, text="Traversals:").grid(row=4, column=0, sticky='w', pady=2)
         self.traversals_var = tk.StringVar(value="1")
-        ttk.Entry(repeating_frame, textvariable=self.traversals_var, width=5).grid(row=3, column=1, sticky='w', pady=2)
-        
+        ttk.Entry(repeating_frame, textvariable=self.traversals_var, width=5).grid(row=4, column=1, sticky='w', pady=2)
+
         # Checkboxes
         self.null_cmd_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(repeating_frame, text="Null Commands", 
-                       variable=self.null_cmd_var).grid(row=4, column=0, columnspan=2, sticky='w', pady=2)
-        
+        ttk.Checkbutton(repeating_frame, text="Null Commands",
+                       variable=self.null_cmd_var).grid(row=5, column=0, columnspan=2, sticky='w', pady=2)
+
         self.use_dist_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(repeating_frame, text="Use Distance-Based Navigation", 
-                       variable=self.use_dist_var).grid(row=5, column=0, columnspan=2, sticky='w', pady=2)
-        
+        ttk.Checkbutton(repeating_frame, text="Use Distance-Based Navigation",
+                       variable=self.use_dist_var).grid(row=6, column=0, columnspan=2, sticky='w', pady=2)
+
         # Image publish mode — constraint depends on the navigation_method
         # the robot is running: classic requires 0, pf2d requires >= 1.
         # The widgets are saved as attributes so `_apply_navigation_method`
@@ -277,17 +306,17 @@ class VTRControlGUI(Node):
             image_pub_default = "1"
             image_pub_state = "normal"
         self.image_pub_label = ttk.Label(repeating_frame, text=image_pub_label)
-        self.image_pub_label.grid(row=6, column=0, sticky='w', pady=2)
+        self.image_pub_label.grid(row=7, column=0, sticky='w', pady=2)
         self.image_pub_var = tk.StringVar(value=image_pub_default)
         self.image_pub_entry = ttk.Entry(repeating_frame, textvariable=self.image_pub_var,
                                          width=5, state=image_pub_state)
-        self.image_pub_entry.grid(row=6, column=1, sticky='w', pady=2)
-        
+        self.image_pub_entry.grid(row=7, column=1, sticky='w', pady=2)
+
         # Send / Stop buttons.  STOP is not in `_gated_widgets` because it
         # has its own state machine driven by goal acceptance / completion,
         # mirroring how STOP MAPPING is handled.
         repeat_btn_frame = ttk.Frame(repeating_frame)
-        repeat_btn_frame.grid(row=7, column=0, columnspan=2, pady=10)
+        repeat_btn_frame.grid(row=8, column=0, columnspan=2, pady=10)
         self.send_repeat_btn = ttk.Button(repeat_btn_frame, text="SEND REPEAT COMMAND",
                                           command=self.send_repeating_goal,
                                           state='disabled')
@@ -950,24 +979,52 @@ class VTRControlGUI(Node):
 
         # /recorded_odometry is published by the voxels simulator natively in
         # ROS REP-103 (after the axis-convention cleanup in ros_voxels). The
-        # /initialpose subscriber also expects ROS REP-103, so we just
-        # republish the recorded pose verbatim — no axis swap, no heading
-        # recovery. (Maps recorded *before* the cleanup contain raylib-axes
-        # data and will teleport to the wrong place; re-record them.)
+        # /initialpose subscriber also expects ROS REP-103, so we use the
+        # recorded pose directly, optionally with a random displacement added
+        # (Displace checkbox). Maps recorded *before* the cleanup contain
+        # raylib-axes data and will teleport to the wrong place; re-record
+        # them.
+        rp = odom_msg.pose.pose.position
+        rq = odom_msg.pose.pose.orientation
+        base_yaw = math.atan2(2.0 * (rq.w * rq.z + rq.x * rq.y),
+                              1.0 - 2.0 * (rq.y * rq.y + rq.z * rq.z))
+
+        if self.displace_var.get():
+            dx = random.uniform(-self.displace_x_span, self.displace_x_span)
+            dy = random.uniform(-self.displace_y_span, self.displace_y_span)
+            dyaw_deg = random.uniform(-self.displace_yaw_span_deg,
+                                      self.displace_yaw_span_deg)
+        else:
+            dx = 0.0
+            dy = 0.0
+            dyaw_deg = 0.0
+
+        out_x = rp.x + dx
+        out_y = rp.y + dy
+        out_yaw = base_yaw + math.radians(dyaw_deg)
+
         msg = PoseWithCovarianceStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = "map"
-        msg.pose.pose = odom_msg.pose.pose
+        msg.pose.pose.position.x = out_x
+        msg.pose.pose.position.y = out_y
+        msg.pose.pose.position.z = rp.z
+        msg.pose.pose.orientation.x = 0.0
+        msg.pose.pose.orientation.y = 0.0
+        msg.pose.pose.orientation.z = math.sin(out_yaw / 2.0)
+        msg.pose.pose.orientation.w = math.cos(out_yaw / 2.0)
         self.teleport_pub.publish(msg)
 
-        rp = odom_msg.pose.pose.position
-        rq = odom_msg.pose.pose.orientation
-        yaw = math.atan2(2.0 * (rq.w * rq.z + rq.x * rq.y),
-                         1.0 - 2.0 * (rq.y * rq.y + rq.z * rq.z))
-        self.log_status(
+        line = (
             f"Teleported to start of '{map_name}': "
-            f"x={rp.x:.2f} y={rp.y:.2f}, heading={math.degrees(yaw):.1f} deg"
+            f"x={out_x:.2f} y={out_y:.2f}, heading={math.degrees(out_yaw):.1f} deg"
         )
+        if self.displace_var.get():
+            line += (
+                f"  [displacement: dx={dx:+.2f} m, dy={dy:+.2f} m, "
+                f"dyaw={dyaw_deg:+.1f} deg]"
+            )
+        self.log_status(line)
 
     def send_stop_repeat(self):
         # Cancel the in-flight repeat goal via the action's native cancel

@@ -88,6 +88,14 @@ def generate_launch_description():
         ),
     )
 
+    # Symmetric ± spans for the GUI's "Displace" checkbox: when set, the
+    # map-start teleport adds a uniform random offset drawn from
+    # [-span, +span] to the recorded start pose. Defaults are deliberately
+    # generous to make stress-testing the repeater the obvious use case.
+    displace_x_span = DeclareLaunchArgument("displace_x_span", default_value="2.0")
+    displace_y_span = DeclareLaunchArgument("displace_y_span", default_value="2.0")
+    displace_yaw_span_deg = DeclareLaunchArgument("displace_yaw_span_deg", default_value="20.0")
+
 
     lc = LaunchConfiguration
 
@@ -181,6 +189,9 @@ def generate_launch_description():
                     # /pfvtr/sensors — the robot is the source of truth.
                     "odom_topic": lc("odom_topic"),
                     "camera_info_topic": lc("camera_info_topic"),
+                    "displace_x_span": lc("displace_x_span"),
+                    "displace_y_span": lc("displace_y_span"),
+                    "displace_yaw_span_deg": lc("displace_yaw_span_deg"),
                 }],
             ),
         ]
@@ -209,5 +220,8 @@ def generate_launch_description():
         matching_type,
         turn_gain,
         navigation_method,
+        displace_x_span,
+        displace_y_span,
+        displace_yaw_span_deg,
         pfvtr_group,
     ])
