@@ -56,6 +56,7 @@ install(PROGRAMS
   src/master/vtr_gui.py
   src/sensors/sensors-ros-2.py
   src/sensors/representations-ros-2.py
+  src/diagnostics/topic_diagnostics.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

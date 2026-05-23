@@ -196,6 +196,17 @@ def generate_launch_description():
                     "displace_yaw_span_deg": lc("displace_yaw_span_deg"),
                 }],
             ),
+            Node(
+                package="pfvtr",
+                executable="topic_diagnostics.py",
+                name="sanity_monitor",
+                output="screen",
+                parameters=[{
+                    "camera_topic": lc("camera_topic"),
+                    "odom_topic": lc("odom_topic"),
+                    "cmd_vel_sub_topic": lc("cmd_vel_teleop_output"),
+                }],
+            ),
         ]
     )
 

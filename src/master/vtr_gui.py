@@ -2,10 +2,12 @@
 import math
 import random
 import threading
+import re
 import tkinter as tk
 from tkinter import ttk, messagebox
 import os
 import glob
+from std_msgs.msg import String, Bool
 
 import numpy as np
 from matplotlib.figure import Figure
@@ -28,6 +30,7 @@ from rclpy.serialization import deserialize_message
 import rosbag2_py
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import CameraInfo
+from std_msgs.msg import String, Bool
 from rcl_interfaces.srv import SetParameters, GetParameters
 from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 from geometry_msgs.msg import PoseWithCovarianceStamped
@@ -107,6 +110,19 @@ class VTRControlGUI(Node):
             PoseWithCovarianceStamped, '/initialpose', teleport_qos
         )
 
+        # Diagnostics GUI consumes the sanity monitor output. The topics are
+        # absolute because the diagnostics node publishes outside the /pfvtr
+        # namespace, even when both nodes are launched inside the namespace.
+        self.sanity_status_sub = self.create_subscription(
+            String, '/sanity_check', self._sanity_status_cb, 10
+        )
+        self.sanity_ready_sub = self.create_subscription(
+            Bool, '/sanity_check/ready', self._sanity_ready_cb, 10
+        )
+        self._sanity_ready = False
+        self._last_sanity_text = ''
+        self._teach_gui_state = "INACTIVE"
+
         self.mapping_goal_handle = None
         self.repeating_goal_handle = None
         self.last_mapping_goal_was_start = False
@@ -148,15 +164,18 @@ class VTRControlGUI(Node):
         self.notebook.pack(fill='both', expand=True, padx=5, pady=5)
 
         self.actions_tab = ttk.Frame(self.notebook)
+        self.diagnostics_tab = ttk.Frame(self.notebook)
         self.control_tab = ttk.Frame(self.notebook)
         self.particles_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.actions_tab, text="Actions")
+        self.notebook.add(self.diagnostics_tab, text="Diagnostics")
         self.notebook.add(self.control_tab, text="Control")
         self.notebook.add(self.particles_tab, text="Particles")
 
         # Topic-rate frame goes first so it sits at the top of the Actions
         # tab — it gates every other button below it.
         self.setup_hz_frame(self.actions_tab)
+        self.setup_diagnostics_frame(self.diagnostics_tab)
         self.setup_mapping_frame(self.actions_tab)
         self.setup_repeating_frame(self.actions_tab)
         self.setup_status_bar(self.actions_tab)
@@ -197,7 +216,161 @@ class VTRControlGUI(Node):
 
         # Periodic ROS2 spinning
         self.root.after(20, self.spin_ros)
-    
+
+    def setup_diagnostics_frame(self, parent):
+        diagnostics_frame = ttk.LabelFrame(parent, text="PFVTR Topic Diagnostics", padding=10)
+        diagnostics_frame.pack(fill='both', expand=True, padx=10, pady=8)
+
+        self.diag_summary_var = tk.StringVar(value="Waiting for /sanity_check...")
+        self.diag_summary_label = ttk.Label(
+            diagnostics_frame,
+            textvariable=self.diag_summary_var,
+            font=("TkDefaultFont", 10, "bold"),
+            foreground="orange",
+        )
+        self.diag_summary_label.pack(fill='x', pady=(0, 8))
+
+        columns = ("topic", "status", "hz", "role")
+        self.diag_tree = ttk.Treeview(
+            diagnostics_frame,
+            columns=columns,
+            show="headings",
+            height=15,
+        )
+        self.diag_tree.heading("topic", text="Topic")
+        self.diag_tree.heading("status", text="Topic activity")
+        self.diag_tree.heading("hz", text="Rate")
+        self.diag_tree.heading("role", text="Purpose")
+        self.diag_tree.column("topic", width=210, anchor="w")
+        self.diag_tree.column("status", width=90, anchor="center")
+        self.diag_tree.column("hz", width=80, anchor="center")
+        self.diag_tree.column("role", width=260, anchor="w")
+        self.diag_tree.pack(fill='both', expand=True)
+
+        self.diag_tree.tag_configure("ok", foreground="green")
+        self.diag_tree.tag_configure("warn", foreground="orange")
+        self.diag_tree.tag_configure("bad", foreground="red")
+        self.diag_tree.tag_configure("idle", foreground="gray")
+
+        self.diag_topics = {
+            "camera": ("/camera_front_publisher", "Raw front camera image stream"),
+            "odometry": ("/odometry_publisher", "Robot odometry estimation"),
+            "live_repr": ("/pfvtr/live_representation", "Current visual representation"),
+            "map_repr": ("/pfvtr/map_representations", "Stored map visual representations"),
+            "matched_repr": ("/pfvtr/matched_repr", "Matched map representation"),
+            "map_vel": ("/pfvtr/map_vel", "Reference control velocity"),
+            "cmd_vel_sub": ("/cmd_vel_subscriber", "Velocity command topic for robot"),
+            "repeat_distance": ("/pfvtr/repeat/distance_remaining", "Estimated remaining route distance"),
+        }
+
+        for key, (topic, role) in self.diag_topics.items():
+            self.diag_tree.insert(
+                "", "end", iid=key,
+                values=(topic, "WAITING", "--", role),
+                tags=("idle",),
+            )
+
+        raw_frame = ttk.LabelFrame(parent, text="Raw /sanity_check message", padding=8)
+        raw_frame.pack(fill='both', expand=False, padx=10, pady=(0, 8))
+        self.diag_raw_text = tk.Text(raw_frame, height=6, width=70, state='disabled')
+        self.diag_raw_text.pack(fill='both', expand=True)
+
+    def _sanity_ready_cb(self, msg):
+        self._sanity_ready = bool(msg.data)
+
+    def _sanity_status_cb(self, msg):
+        self._last_sanity_text = msg.data
+        self.root.after(0, self._update_diagnostics_tab)
+
+    def _parse_sanity_report(self, text):
+        lines = text.splitlines()
+        state = lines[0].strip() if lines else "UNKNOWN"
+
+        values = {}
+        runtime = {
+            "teach": "UNKNOWN",
+            "repeat": "UNKNOWN",
+        }
+
+        for match in re.finditer(r'([A-Za-z0-9_]+)=([^,\n|]+)', text):
+            key = match.group(1).strip()
+            value = match.group(2).strip()
+
+            if key in runtime:
+                runtime[key] = value
+            else:
+                values[key] = value
+
+        return state, runtime, values
+
+    def _update_diagnostics_tab(self):
+        if not hasattr(self, 'diag_tree'):
+            return
+
+        text = self._last_sanity_text
+        if not text:
+            return
+
+        state, runtime, values = self._parse_sanity_report(text)
+
+        teach_state = self._teach_gui_state
+        repeat_state = runtime.get("repeat", "UNKNOWN")
+
+        if self._sanity_ready or state == "READY":
+            color = "green"
+        elif state == "NOT_READY":
+            color = "red"
+        else:
+            color = "orange"
+
+        self.diag_summary_var.set(
+            f"Stack: {state} | Teach: {teach_state} | Repeat: {repeat_state}"
+        )
+        self.diag_summary_label.config(foreground=color)
+
+        for key, (topic, role) in self.diag_topics.items():
+            value = values.get(key, "WAITING")
+            hz = "--"
+            status = value
+            tag = "idle"
+
+            hz_match = re.match(r'([0-9]+(?:\.[0-9]+)?)Hz', value)
+
+            if hz_match:
+                hz = f"{float(hz_match.group(1)):.1f} Hz"
+                status = "PUBLISHING"
+                tag = "ok"
+            elif value.startswith("NO_MSG"):
+                status = "NO_MSG"
+                tag = "warn"
+            elif value.startswith("TIMEOUT"):
+                if key in ("map_vel", "cmd_vel_sub", "repeat_distance") and repeat_state == "INACTIVE":
+                    status = "INACTIVE"
+                    tag = "warn"
+                elif key == "map_repr" and teach_state == "INACTIVE" and repeat_state == "INACTIVE":
+                    status = "INACTIVE"
+                    tag = "warn"
+                else:
+                    status = value
+                    tag = "bad"
+            elif value.startswith("NOT_FOUND"):
+                status = "NOT_FOUND"
+                tag = "bad"
+            elif value == "WAITING":
+                status = "WAITING"
+                tag = "idle"
+
+            self.diag_tree.item(
+                key,
+                values=(topic, status, hz, role),
+                tags=(tag,)
+            )
+
+        self.diag_raw_text.configure(state='normal')
+        self.diag_raw_text.delete('1.0', 'end')
+        self.diag_raw_text.insert('1.0', text)
+        self.diag_raw_text.configure(state='disabled')
+
     def setup_mapping_frame(self, parent):
         mapping_frame = ttk.LabelFrame(parent, text="Mapping Controls", padding=10)
         mapping_frame.pack(fill='x', padx=10, pady=5)
@@ -1178,12 +1351,14 @@ class VTRControlGUI(Node):
             self.log_status("Starting mapping - disabling START button, enabling STOP button")
             self.start_mapping_btn['state'] = 'disabled'
             self.stop_mapping_btn['state'] = 'normal'
+            self._teach_gui_state = "RUNNING"
             self.root.update_idletasks()
         else:
             # Stopping mapping: disable STOP, enable START
             self.log_status("Stopping mapping - enabling START button, disabling STOP button")
             self.start_mapping_btn['state'] = 'normal'
             self.stop_mapping_btn['state'] = 'disabled'
+            self._teach_gui_state = "INACTIVE"
             self.root.update_idletasks()
         
         future = self.mapmaker_client.send_goal_async(
