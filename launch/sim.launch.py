@@ -9,7 +9,7 @@ def generate_launch_description():
     camera_topic = DeclareLaunchArgument(
         "camera_topic",
         default_value="/camera_front_publisher",
-        description="Camera topic name",
+        description="Image topic consumed by representations, mapmaker, and repeater.",
     )
 
     camera_back_topic = DeclareLaunchArgument(
@@ -17,33 +17,32 @@ def generate_launch_description():
         default_value="",
         description=(
             "Rear-facing camera topic used when the MapMaker action is "
-            "called with record_backward=true. Empty (the default) disables "
-            "backward mapping — such goals will be rejected with an error."
+            "called with record_backward=true. Empty disables backward mapping."
         ),
     )
 
     cmd_vel_teleop_output = DeclareLaunchArgument(
         "cmd_vel_teleop_output",
-        default_value="/cmd_vel_publisher",
-        description="Topic where simulator publishes teleop commands (for recording)",
+        default_value="/cmd_vel_subscriber",
+        description="Topic where simulator publishes teleop commands for map recording.",
     )
 
     cmd_vel_robot_input = DeclareLaunchArgument(
         "cmd_vel_robot_input",
         default_value="/cmd_vel_subscriber",
-        description="Topic to send velocity commands to control the robot",
+        description="Topic where PFVTR controller publishes velocity commands.",
     )
 
     odom_topic = DeclareLaunchArgument(
         "odom_topic",
         default_value="/odometry_publisher",
-        description="Topic for odometry input",
+        description="Odometry topic consumed by sensors.",
     )
 
     odom_record_topic = DeclareLaunchArgument(
         "odom_record_topic",
         default_value="/odometry_publisher",
-        description="Topic for odometry recording in mapmaker",
+        description="Odometry topic recorded by mapmaker.",
     )
 
     particle_num = DeclareLaunchArgument("particle_num", default_value="600")
@@ -59,32 +58,31 @@ def generate_launch_description():
         "position_estimator",
         default_value="kde",
         description=(
-            "PF2D output estimator. 'kde' picks the dominant mode (default, "
-            "correct under multimodal posteriors). 'weighted_mean' is the legacy "
-            "centroid (drifts between modes but well-tested)."
+            "PF2D output estimator. 'kde' picks the dominant mode. "
+            "'weighted_mean' is the legacy centroid estimator."
         ),
     )
     kde_grid_res = DeclareLaunchArgument("kde_grid_res", default_value="64")
     kde_align_span = DeclareLaunchArgument("kde_align_span", default_value="0.5")
     kde_min_align_frac = DeclareLaunchArgument("kde_min_align_frac", default_value="0.08")
     matching_type = DeclareLaunchArgument("matching_type", default_value="siam")
-    turn_gain = DeclareLaunchArgument("turn_gain", default_value="0.5")
+
+    turn_gain = DeclareLaunchArgument("turn_gain", default_value="1.0")
+    velocity_gain = DeclareLaunchArgument("velocity_gain", default_value="1.0")
 
     navigation_method = DeclareLaunchArgument(
         "navigation_method",
-        default_value="classic",
+        default_value="pf2d",
         description=(
             "Repeat-phase fusion method. "
             "'classic' = Bearnav Classic image-based correction "
-            "(requires GUI/action image_pub == 0). "
-            "'pf2d' = particle filter using PF2D parameters "
-            "(particle_num, odom_error, etc.; requires image_pub >= 1)."
+            "(requires action image_pub == 0). "
+            "'pf2d' = particle-filter repeat using PF2D parameters "
+            "(requires image_pub >= 1)."
         ),
     )
 
-
     lc = LaunchConfiguration
-
 
     pfvtr_group = GroupAction(
         [
@@ -137,6 +135,7 @@ def generate_launch_description():
                 parameters=[{
                     "cmd_vel_topic": lc("cmd_vel_robot_input"),
                     "turn_gain": lc("turn_gain"),
+                    "velocity_gain": lc("velocity_gain"),
                 }],
             ),
 
@@ -151,7 +150,7 @@ def generate_launch_description():
                     "camera_back_topic": lc("camera_back_topic"),
                     "cmd_vel_topic": lc("cmd_vel_teleop_output"),
                     "odom_record_topic": lc("odom_record_topic"),
-                }]
+                }],
             ),
 
             Node(
@@ -162,6 +161,18 @@ def generate_launch_description():
                 respawn=True,
                 parameters=[{
                     "camera_topic": lc("camera_topic"),
+                }],
+            ),
+
+            Node(
+                package="pfvtr",
+                executable="topic_diagnostics.py",
+                name="sanity_monitor",
+                output="screen",
+                parameters=[{
+                    "camera_topic": lc("camera_topic"),
+                    "odom_topic": lc("odom_topic"),
+                    "cmd_vel_sub_topic": lc("cmd_vel_teleop_output"),
                 }],
             ),
         ]
@@ -188,6 +199,7 @@ def generate_launch_description():
         kde_min_align_frac,
         matching_type,
         turn_gain,
+        velocity_gain,
         navigation_method,
         pfvtr_group,
     ])
