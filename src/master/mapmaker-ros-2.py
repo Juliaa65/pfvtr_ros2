@@ -708,7 +708,19 @@ class MapmakerServer(Node):
 
             try:
                 os.makedirs(MAPS_DIR, exist_ok=True)
-                os.mkdir(_map_path(goal.map_name))
+                map_dir = _map_path(goal.map_name)
+                # Never overwrite an existing map: archive it with a timestamp
+                # suffix and record a fresh one under the requested name.
+                if os.path.exists(map_dir):
+                    ts = time.strftime("%Y%m%d_%H%M%S")
+                    backup = _map_path(f"{goal.map_name}_{ts}")
+                    os.rename(map_dir, backup)
+                    self.get_logger().warn(
+                        "\n" + "=" * 64 +
+                        f"\n  MAP '{goal.map_name}' ALREADY EXISTS — existing map renamed to"
+                        f"\n  '{goal.map_name}_{ts}'; recording a fresh '{goal.map_name}'."
+                        "\n" + "=" * 64)
+                os.mkdir(map_dir)
                 with open(_map_path(goal.map_name, "params"), "w") as f:
                     f.write(f"stepSize: {self.mapStep}\n")
                     f.write(f"cmdVelTopic: {self.cmd_vel_topic}\n")
