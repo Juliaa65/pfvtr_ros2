@@ -75,6 +75,7 @@ def generate_launch_description():
     kde_min_align_frac = DeclareLaunchArgument("kde_min_align_frac", default_value="0.08")
     matching_type = DeclareLaunchArgument("matching_type", default_value="siam")
     turn_gain = DeclareLaunchArgument("turn_gain", default_value="1.0")
+    velocity_gain = DeclareLaunchArgument("velocity_gain", default_value="1.0")
 
     navigation_method = DeclareLaunchArgument(
         "navigation_method",
@@ -151,6 +152,7 @@ def generate_launch_description():
                 parameters=[{
                     "cmd_vel_topic": lc("cmd_vel_robot_input"),
                     "turn_gain": lc("turn_gain"),
+                    "velocity_gain": lc("velocity_gain"),
                 }],
             ),
 
@@ -194,6 +196,17 @@ def generate_launch_description():
                     "displace_yaw_span_deg": lc("displace_yaw_span_deg"),
                 }],
             ),
+            Node(
+                package="pfvtr",
+                executable="topic_diagnostics.py",
+                name="sanity_monitor",
+                output="screen",
+                parameters=[{
+                    "camera_topic": lc("camera_topic"),
+                    "odom_topic": lc("odom_topic"),
+                    "cmd_vel_sub_topic": lc("cmd_vel_teleop_output"),
+                }],
+            ),
         ]
     )
 
@@ -219,6 +232,7 @@ def generate_launch_description():
         kde_min_align_frac,
         matching_type,
         turn_gain,
+        velocity_gain,
         navigation_method,
         displace_x_span,
         displace_y_span,
