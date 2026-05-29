@@ -15,13 +15,15 @@ from rclpy.action import ActionServer, GoalResponse, CancelResponse
 from rclpy.serialization import serialize_message, deserialize_message
 from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+from rclpy.time import Time
+from rclpy.duration import Duration
 
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import Twist, TwistStamped
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Header
 
-from message_filters import ApproximateTimeSynchronizer, Subscriber
+from message_filters import ApproximateTimeSynchronizer, Cache, Subscriber
 from cv_bridge import CvBridge
 
 import rosbag2_py
@@ -71,6 +73,29 @@ def numpy_to_feature(array):
     return Features(values=array[0].flatten().tolist(), shape=list(array[0].shape), descriptors=array[1])
 
 
+def _lookup_nearest(cache: Cache, stamp: Time, slop: Duration):
+    """Return the cached message whose header stamp is nearest to ``stamp`` within ±slop."""
+    t0 = stamp - slop
+    t1 = stamp + slop
+    best_msg = None
+    best_dt_ns = None
+    best_is_before = False
+    for msg, msg_time in zip(cache.cache_msgs, cache.cache_times):
+        if msg_time < t0 or msg_time > t1:
+            continue
+        dt_ns = abs((msg_time - stamp).nanoseconds)
+        is_before = msg_time <= stamp
+        if (
+            best_msg is None
+            or dt_ns < best_dt_ns
+            or (dt_ns == best_dt_ns and is_before and not best_is_before)
+        ):
+            best_msg = msg
+            best_dt_ns = dt_ns
+            best_is_before = is_before
+    return best_msg
+
+
 def save_img(img_repr, image_msg: Image, header: Header, map_name: str,
              curr_dist, curr_hist, curr_align, source_map, save_img_flag: bool,
              bridge: CvBridge):
@@ -115,7 +140,7 @@ class MapmakerServer(Node):
         # Background worker that serializes waypoint writes to disk so that
         # cv2.imwrite + np.save do not block the rclpy executor thread. Both
         # release the GIL during file I/O, so a plain daemon thread keeps
-        # sync callbacks firing while the previous waypoint is still on disk.
+        # teach callbacks firing while the previous waypoint is still on disk.
         self._save_queue: Queue = Queue()
         self._save_worker = threading.Thread(
             target=self._save_worker_loop, daemon=True, name="mapmaker-save-worker"
@@ -130,7 +155,8 @@ class MapmakerServer(Node):
         self.mapName = ""
         self.mapStep = 1.0
         self.nextStep = 0.0
-        self._startup_skip_count = 0  # flush stale sync-queue triples after START
+        self._startup_skip_count = 0  # flush stale repr frames after START
+        self._last_teach_lookup_warn_ns = 0
         self.visual_turn = True
         self.max_trans = 0.3
         self.curr_trans = 0.0
@@ -155,6 +181,12 @@ class MapmakerServer(Node):
         # Empty string means "no rear camera configured" — backward mapping
         # requests will be rejected in that case.
         self.declare_parameter("camera_back_topic", "")
+        # Teach lookup buffers: repr triggers; dist/cam are looked up by stamp.
+        # teach_cam_cache_size is in messages — raise if CNN latency * camera_hz
+        # exceeds this (e.g. 60–90 for ~2s lag at 30 Hz).
+        self.declare_parameter("teach_dist_cache_size", 1000)
+        self.declare_parameter("teach_cam_cache_size", 10)
+        self.declare_parameter("teach_lookup_slop_sec", 0.5)
 
         self.joy_topic = self.get_parameter("cmd_vel_topic").value
         self.cmd_vel_topic = self.get_parameter("cmd_vel_topic").value
@@ -165,10 +197,17 @@ class MapmakerServer(Node):
         ).strip()
         self._default_camera_topic = self.camera_topic
         self._active_camera_topic = self.camera_topic
+        self._teach_dist_cache_size = int(self.get_parameter("teach_dist_cache_size").value)
+        self._teach_cam_cache_size = int(self.get_parameter("teach_cam_cache_size").value)
+        self._teach_lookup_slop_sec = float(self.get_parameter("teach_lookup_slop_sec").value)
 
         self._backward_record = False
         self._active_map_dir = ""
         self._teach_msg_filter_subs = []
+        self._repr_sub = None
+        self._dist_cache = None
+        self._cam_cache = None
+        self.synced_topics = None
 
 
         self.get_logger().info("Waiting for services to become available...")
@@ -298,8 +337,13 @@ class MapmakerServer(Node):
             self.align_in_progress = True
 
     def _teardown_teach_sync(self):
+        if self._repr_sub is not None:
+            try:
+                self.destroy_subscription(self._repr_sub)
+            except Exception:
+                pass
+            self._repr_sub = None
         # message_filters.Subscriber holds an rclpy Subscription in `.sub`.
-        # Destroy each so the topic binding is released before we rebuild.
         for mf_sub in self._teach_msg_filter_subs:
             inner = getattr(mf_sub, "sub", None)
             if inner is not None:
@@ -308,21 +352,55 @@ class MapmakerServer(Node):
                 except Exception:
                     pass
         self._teach_msg_filter_subs = []
-        self.synced_topics = None
+        self._dist_cache = None
+        self._cam_cache = None
 
     def _setup_teach_sync(self):
-        repr_sub = Subscriber(self, FeaturesList, "live_representation", qos_profile=SYNC_QOS)
+        dist_sub = Subscriber(self, SensorsOutput, "teach/output_dist", qos_profile=SYNC_QOS)
+        self._dist_cache = Cache(dist_sub, cache_size=self._teach_dist_cache_size)
+
         cam_sub = Subscriber(self, Image, self.camera_topic, qos_profile=SYNC_QOS)
-        distance_sub = Subscriber(self, SensorsOutput, "teach/output_dist", qos_profile=SYNC_QOS)
+        self._cam_cache = Cache(cam_sub, cache_size=self._teach_cam_cache_size)
 
-        self._teach_msg_filter_subs = [repr_sub, cam_sub, distance_sub]
+        self._teach_msg_filter_subs = [dist_sub, cam_sub]
 
-        self.synced_topics = ApproximateTimeSynchronizer(
-            [repr_sub, distance_sub, cam_sub],
-            queue_size=20,
-            slop=0.5
+        self._repr_sub = self.create_subscription(
+            FeaturesList,
+            "live_representation",
+            self._repr_cb,
+            SYNC_QOS,
         )
-        self.synced_topics.registerCallback(self.distance_img_cb)
+
+    def _warn_teach_lookup_throttled(self, message: str):
+        now_ns = self.get_clock().now().nanoseconds
+        if now_ns - self._last_teach_lookup_warn_ns < 2_000_000_000:
+            return
+        self._last_teach_lookup_warn_ns = now_ns
+        self.get_logger().warn(message)
+
+    def _repr_cb(self, repr_msg: FeaturesList):
+        if not hasattr(repr_msg, "header") or repr_msg.header is None:
+            self._warn_teach_lookup_throttled("Teach lookup: live_representation missing header")
+            return
+
+        stamp = Time.from_msg(repr_msg.header.stamp)
+        slop = Duration(seconds=self._teach_lookup_slop_sec)
+
+        dist_msg = _lookup_nearest(self._dist_cache, stamp, slop)
+        if dist_msg is None:
+            self._warn_teach_lookup_throttled(
+                "Teach lookup: no teach/output_dist within slop of repr stamp"
+            )
+            return
+
+        img_msg = _lookup_nearest(self._cam_cache, stamp, slop)
+        if img_msg is None:
+            self._warn_teach_lookup_throttled(
+                "Teach lookup: no camera image within slop of repr stamp"
+            )
+            return
+
+        self.distance_img_cb(repr_msg, dist_msg, img_msg)
 
     async def _request_representations_camera(self, topic: str) -> bool:
         if not self.set_camera_cli.wait_for_service(timeout_sec=2.0):
@@ -393,10 +471,8 @@ class MapmakerServer(Node):
         if not self.isMapping:
             return
 
-        # Flush any sync triples that were buffered before isMapping flipped.
-        # With slop=0.3s + queue_size=10, pre-start messages can still pair
-        # with fresh post-start ones and fire a callback whose `dist` is stale
-        # relative to the teach/set_dist reset that happened just before.
+        # Flush repr frames still in flight from before isMapping flipped.
+        # Their distance lookup can reflect pre teach/set_dist state.
         if self._startup_skip_count > 0:
             self._startup_skip_count -= 1
             return

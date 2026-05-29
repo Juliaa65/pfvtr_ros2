@@ -430,7 +430,7 @@ class RepeaterServer(Node):
 
             msg = deserialize_message(data, DistancedTwist)
 
-            if self.null_cmd and msg.twist.linear.x == 0.0 and msg.twist.linear.y == 0.0 and msg.twist.angular.z == 0.0:
+            if self.null_cmd and msg.twist.linear.x < 0.01:
                 continue
 
             self.action_dists.append(float(msg.distance))
