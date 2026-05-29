@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
 import os
+import sys
 import time
 import shutil
 import threading
 from queue import Queue
+
+# camera_input is installed next to this script (lib/pfvtr) and lives in src/sensors.
+for _pfvtr_py_dir in (
+    os.path.dirname(os.path.abspath(__file__)),
+    os.path.normpath(
+        os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "sensors")
+    ),
+):
+    if os.path.isdir(_pfvtr_py_dir) and _pfvtr_py_dir not in sys.path:
+        sys.path.insert(0, _pfvtr_py_dir)
 
 
 import numpy as np
@@ -18,7 +29,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from rclpy.time import Time
 from rclpy.duration import Duration
 
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CompressedImage, Image
 from geometry_msgs.msg import Twist, TwistStamped
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Header
@@ -31,6 +42,11 @@ import rosbag2_py
 from pfvtr.action import MapMaker
 from pfvtr.msg import SensorsOutput, SensorsInput, DistancedTwist, Features, FeaturesList
 from pfvtr.srv import SetDist, Alignment, SetCameraTopic
+from camera_input import (
+    camera_message_type,
+    parse_camera_msg,
+    resolve_camera_transport,
+)
 
 NAVIGATION_QOS = QoSProfile(
     depth=1,
@@ -40,6 +56,13 @@ NAVIGATION_QOS = QoSProfile(
 
 SYNC_QOS = QoSProfile(
     depth=10,
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    durability=DurabilityPolicy.VOLATILE
+)
+
+# Shallow queue for camera frames over Zenoh — avoids stacking stale JPEGs.
+CAMERA_SYNC_QOS = QoSProfile(
+    depth=2,
     reliability=ReliabilityPolicy.BEST_EFFORT,
     durability=DurabilityPolicy.VOLATILE
 )
@@ -178,6 +201,7 @@ class MapmakerServer(Node):
         self.declare_parameter("cmd_vel_topic", "/bluetooth_teleop/cmd_vel")
         self.declare_parameter("odom_record_topic", "/odometry_publisher")
         self.declare_parameter("camera_topic", "/camera_front_publisher")
+        self.declare_parameter("camera_transport", "raw")
         # Empty string means "no rear camera configured" — backward mapping
         # requests will be rejected in that case.
         self.declare_parameter("camera_back_topic", "")
@@ -186,17 +210,21 @@ class MapmakerServer(Node):
         # exceeds this (e.g. 60–90 for ~2s lag at 30 Hz).
         self.declare_parameter("teach_dist_cache_size", 1000)
         self.declare_parameter("teach_cam_cache_size", 10)
-        self.declare_parameter("teach_lookup_slop_sec", 0.5)
+        self.declare_parameter("teach_lookup_slop_sec", 1.5)
 
         self.joy_topic = self.get_parameter("cmd_vel_topic").value
         self.cmd_vel_topic = self.get_parameter("cmd_vel_topic").value
         self.odom_record_topic = self.get_parameter("odom_record_topic").value
         self.camera_topic = self.get_parameter("camera_topic").value
+        self._camera_transport_param = self.get_parameter("camera_transport").value
         self.camera_back_topic = (
             self.get_parameter("camera_back_topic").value or ""
         ).strip()
         self._default_camera_topic = self.camera_topic
         self._active_camera_topic = self.camera_topic
+        self._camera_transport = resolve_camera_transport(
+            self._camera_transport_param, self.camera_topic
+        )
         self._teach_dist_cache_size = int(self.get_parameter("teach_dist_cache_size").value)
         self._teach_cam_cache_size = int(self.get_parameter("teach_cam_cache_size").value)
         self._teach_lookup_slop_sec = float(self.get_parameter("teach_lookup_slop_sec").value)
@@ -355,11 +383,30 @@ class MapmakerServer(Node):
         self._dist_cache = None
         self._cam_cache = None
 
+    def _camera_sync_qos(self):
+        if self._camera_transport == "compressed":
+            return CAMERA_SYNC_QOS
+        return SYNC_QOS
+
+    def _to_raw_image(self, msg):
+        if self._camera_transport == "raw":
+            return msg
+        decoded, _ = parse_camera_msg(msg, self.bridge)
+        return decoded
+
     def _setup_teach_sync(self):
+        self._camera_transport = resolve_camera_transport(
+            self._camera_transport_param, self.camera_topic
+        )
+        cam_msg_type = camera_message_type(self._camera_transport)
+        cam_qos = self._camera_sync_qos()
+
         dist_sub = Subscriber(self, SensorsOutput, "teach/output_dist", qos_profile=SYNC_QOS)
         self._dist_cache = Cache(dist_sub, cache_size=self._teach_dist_cache_size)
 
-        cam_sub = Subscriber(self, Image, self.camera_topic, qos_profile=SYNC_QOS)
+        cam_sub = Subscriber(
+            self, cam_msg_type, self.camera_topic, qos_profile=cam_qos
+        )
         self._cam_cache = Cache(cam_sub, cache_size=self._teach_cam_cache_size)
 
         self._teach_msg_filter_subs = [dist_sub, cam_sub]
@@ -400,6 +447,13 @@ class MapmakerServer(Node):
             )
             return
 
+        img_msg = self._to_raw_image(img_msg)
+        if img_msg is None:
+            self._warn_teach_lookup_throttled(
+                "Teach lookup: camera frame decode failed"
+            )
+            return
+
         self.distance_img_cb(repr_msg, dist_msg, img_msg)
 
     async def _request_representations_camera(self, topic: str) -> bool:
@@ -427,11 +481,24 @@ class MapmakerServer(Node):
         self._teardown_teach_sync()
         self._setup_teach_sync()
         self._active_camera_topic = topic
-        self.get_logger().warn(f"Mapmaker camera rebound to '{topic}'")
+        self._camera_transport = resolve_camera_transport(
+            self._camera_transport_param, self.camera_topic
+        )
+        self.get_logger().warn(
+            f"Mapmaker camera rebound to '{topic}' ({self._camera_transport})"
+        )
 
     def _setup_repeat_sync(self):
+        self._camera_transport = resolve_camera_transport(
+            self._camera_transport_param, self.camera_topic
+        )
+        cam_msg_type = camera_message_type(self._camera_transport)
+        cam_qos = self._camera_sync_qos()
+
         repr_sub = Subscriber(self, FeaturesList, "live_representation", qos_profile=SYNC_QOS)
-        cam_sub = Subscriber(self, Image, self.camera_topic, qos_profile=SYNC_QOS)
+        cam_sub = Subscriber(
+            self, cam_msg_type, self.camera_topic, qos_profile=cam_qos
+        )
         distance_sub = Subscriber(self, SensorsOutput, "repeat/output_dist", qos_profile=SYNC_QOS)
         align_sub = Subscriber(self, SensorsOutput, "repeat/output_align", qos_profile=SYNC_QOS)
 
@@ -452,8 +519,17 @@ class MapmakerServer(Node):
         # is open.
         self.lastOdom = msg
 
-    def distance_wrapper_cb(self, repr_msg: FeaturesList, dist_msg: SensorsOutput, align_msg: SensorsOutput, img: Image):
+    def distance_wrapper_cb(
+        self,
+        repr_msg: FeaturesList,
+        dist_msg: SensorsOutput,
+        align_msg: SensorsOutput,
+        img,
+    ):
         self.curr_alignment = align_msg.output
+        img = self._to_raw_image(img)
+        if img is None:
+            return
         self.distance_img_cb(repr_msg, dist_msg, img)
 
     def distance_img_cb(self, repr_msg: FeaturesList, dist_msg: SensorsOutput, img: Image):

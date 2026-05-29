@@ -60,6 +60,12 @@ install(PROGRAMS
   DESTINATION lib/${PROJECT_NAME}
 )
 
+# Shared by mapmaker (lib/pfvtr) and representations; must live next to executables.
+install(FILES
+  src/sensors/camera_input.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 install(DIRECTORY
   launch
   DESTINATION share/${PROJECT_NAME}

@@ -37,7 +37,7 @@ class ControllerNode(Node):
         # Linear ramp distance (m) for end-of-map deceleration. Within this
         # distance to map end, linear.x and angular.z are scaled by
         # remaining/decel_distance. <=0 disables the ramp.
-        self.declare_parameter("decel_distance", 1.0)
+        self.declare_parameter("decel_distance", 4.0)
 
         cmd_vel_topic = self.get_parameter("cmd_vel_topic").value
         cb_group = get_exclusive_callback_group()
