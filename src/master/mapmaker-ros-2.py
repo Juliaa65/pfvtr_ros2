@@ -2,6 +2,7 @@
 import os
 import sys
 import time
+import math
 import shutil
 import threading
 from queue import Queue
@@ -733,27 +734,29 @@ class MapmakerServer(Node):
             messages.append((t_ns, topic, data))
         del reader  # SequentialReader closes on destruction
 
-        # Reverse chronological order so distance runs ascending after
-        # transformation, then transform DistancedTwist payloads in place.
-        messages.sort(key=lambda x: x[0])
-        messages.reverse()
-
-        transformed = []
-        for (_t_ns, topic, data) in messages:
+        # Group messages into per-waypoint frames by original timestamp: the
+        # mapmaker writes /recorded_actions and /recorded_odometry with the
+        # SAME now_ns in each joy_cb, so a shared timestamp identifies one
+        # waypoint. Keeping action and its odometry paired (same output stamp)
+        # is what lets the repeater's trajectory mode re-associate poses with
+        # distances after reversal.
+        frames = {}  # orig_ns -> {"action": data, "odom": data, "other": [(topic, data)]}
+        order = []   # orig_ns in first-seen order
+        for (t_ns, topic, data) in messages:
+            if t_ns not in frames:
+                frames[t_ns] = {"action": None, "odom": None, "other": []}
+                order.append(t_ns)
             if topic == "/recorded_actions":
-                try:
-                    msg = deserialize_message(data, DistancedTwist)
-                    msg.distance = float(max_dist) - float(msg.distance)
-                    msg.twist.angular.z = float(-msg.twist.angular.z)
-                    # linear.x is intentionally left untouched — it was
-                    # positive during forward teach and must remain positive
-                    # for the forward repeat after the robot turns around.
-                    data = serialize_message(msg)
-                except Exception as e:
-                    self.get_logger().warn(
-                        f"Failed to transform /recorded_actions entry: {e}"
-                    )
-            transformed.append((topic, data))
+                frames[t_ns]["action"] = data
+            elif topic == "/recorded_odometry":
+                frames[t_ns]["odom"] = data
+            else:
+                frames[t_ns]["other"].append((topic, data))
+
+        # Reverse frame order so distance runs ascending from point B after the
+        # per-frame distance rebase.
+        order.sort()
+        order.reverse()
 
         tmp_dir = bag_dir + ".rev"
         if os.path.exists(tmp_dir):
@@ -772,13 +775,60 @@ class MapmakerServer(Node):
                 serialization_format="cdr",
             ))
 
-        # Monotonically-increasing synthetic timestamps; the repeater's
-        # action-replay path matches by `msg.distance`, not by bag stamp,
-        # so exact original timing isn't required.
+        # Monotonically-increasing synthetic timestamps; the repeater matches
+        # actions by `msg.distance`, and pairs odometry with the action sharing
+        # the same stamp, so exact original timing isn't required — only that
+        # action and its odometry keep a common stamp.
         base_ns = self.get_clock().now().nanoseconds
         step_ns = 1_000_000  # 1 ms
-        for i, (topic, data) in enumerate(transformed):
-            writer.write(topic, data, base_ns + i * step_ns)
+        for i, t_ns in enumerate(order):
+            frame = frames[t_ns]
+            stamp = base_ns + i * step_ns
+
+            # Action: rebase distance to ascend from B, negate angular.z.
+            if frame["action"] is not None:
+                data = frame["action"]
+                try:
+                    msg = deserialize_message(data, DistancedTwist)
+                    msg.distance = float(max_dist) - float(msg.distance)
+                    msg.twist.angular.z = float(-msg.twist.angular.z)
+                    # linear.x is intentionally left untouched — it was
+                    # positive during forward teach and must remain positive
+                    # for the forward repeat after the robot turns around.
+                    data = serialize_message(msg)
+                except Exception as e:
+                    self.get_logger().warn(
+                        f"Failed to transform /recorded_actions entry: {e}"
+                    )
+                writer.write("/recorded_actions", data, stamp)
+
+            # Odometry: keep position, rotate heading by 180° — the robot
+            # retraces the same spatial path facing the opposite way after the
+            # physical turn. Written with the action's stamp to preserve the
+            # pairing the repeater's trajectory mode relies on.
+            if frame["odom"] is not None:
+                data = frame["odom"]
+                try:
+                    odom = deserialize_message(data, Odometry)
+                    q = odom.pose.pose.orientation
+                    yaw = math.atan2(
+                        2.0 * (q.w * q.z + q.x * q.y),
+                        1.0 - 2.0 * (q.y * q.y + q.z * q.z),
+                    ) + math.pi
+                    q.x = 0.0
+                    q.y = 0.0
+                    q.z = math.sin(yaw / 2.0)
+                    q.w = math.cos(yaw / 2.0)
+                    data = serialize_message(odom)
+                except Exception as e:
+                    self.get_logger().warn(
+                        f"Failed to transform /recorded_odometry entry: {e}"
+                    )
+                writer.write("/recorded_odometry", data, stamp)
+
+            # Any other topics: pass through unchanged at this stamp.
+            for (topic, data) in frame["other"]:
+                writer.write(topic, data, stamp)
 
         del writer
 
