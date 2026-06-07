@@ -3,6 +3,7 @@ import math
 import random
 import threading
 import re
+import subprocess
 import tkinter as tk
 from tkinter import ttk, messagebox
 import os
@@ -129,7 +130,7 @@ class VTRControlGUI(Node):
 
         self.root = tk.Tk()
         self.root.title("VT&R Control Panel")
-        self.root.geometry("620x920")
+        self.root.geometry("620x1040")
 
         # Buttons that depend on the rest of the stack being up.  Created
         # disabled, flipped to normal by `_check_stack_ready()` once the
@@ -179,6 +180,7 @@ class VTRControlGUI(Node):
         self.setup_mapping_frame(self.actions_tab)
         self.setup_repeating_frame(self.actions_tab)
         self.setup_status_bar(self.actions_tab)
+        self.setup_kill_frame(self.actions_tab)
         self.setup_control_frame(self.control_tab)
         self.setup_particles_frame(self.particles_tab)
         # Map list is populated by `_check_stack_ready` once the repeater's
@@ -541,6 +543,77 @@ class VTRControlGUI(Node):
                                           state='disabled')
         self.stop_repeat_btn.pack(side='left', padx=5)
     
+    def setup_kill_frame(self, parent):
+        # Panic button: tears down the whole tmux session that launched the
+        # stack (simulator + pfvtr + experiment), which also terminates this
+        # GUI since it runs inside that session. Plain tk.Button (not ttk) so
+        # the red background applies directly on all themes.
+        kill_frame = ttk.Frame(parent)
+        kill_frame.pack(fill='x', padx=10, pady=(8, 8))
+
+        self.kill_btn = tk.Button(
+            kill_frame,
+            text="KILL EVERYTHING",
+            command=self._kill_everything,
+            bg="#cc0000",
+            fg="white",
+            activebackground="#ff1a1a",
+            activeforeground="white",
+            font=("TkDefaultFont", 16, "bold"),
+            height=2,
+            relief="raised",
+            bd=3,
+        )
+        self.kill_btn.pack(fill='x')
+
+    def _kill_everything(self):
+        # Destructive: confirm first. Kills the known launch sessions; this
+        # stops the simulator, the pfvtr nodes, any running experiment, and
+        # the GUI itself (it lives in the 'testbed' session).
+        if not messagebox.askyesno(
+            "Kill everything",
+            "This will kill the tmux session(s) running the simulator, the "
+            "pfvtr stack, any experiment, and this GUI.\n\nProceed?",
+        ):
+            return
+
+        self.log_status("KILL EVERYTHING requested — terminating tmux sessions...")
+        # Force a UI repaint so the log line shows before the GUI dies.
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            pass
+
+        # The kill must run in a DETACHED process. This GUI lives in the
+        # 'testbed' session's pfvtr pane, so running `tmux kill-session`
+        # in-process (sharing the pane's process group) races with the pane
+        # teardown: the kill client — and the GUI — get SIGHUP'd the instant
+        # the session starts dying, interrupting the teardown and leaving the
+        # other nodes orphaned. start_new_session=True puts the killer in its
+        # own session so it is NOT signalled by the pane teardown and finishes
+        # killing every session even after this GUI has exited. The short
+        # sleep lets os._exit() below complete first.
+        kill_script = (
+            "sleep 0.3; "
+            "tmux kill-session -t testbed 2>/dev/null; "
+            "tmux kill-session -t testing 2>/dev/null"
+        )
+        try:
+            subprocess.Popen(
+                ["bash", "-c", kill_script],
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            self.log_status("ERROR: cannot spawn kill process (bash not found).")
+            return
+
+        # Terminate the GUI itself immediately; the detached killer above then
+        # tears down the rest of the stack. os._exit bypasses the Tk mainloop /
+        # rclpy teardown and guarantees this process dies right away.
+        os._exit(0)
+
     def setup_status_bar(self, parent):
         status_frame = ttk.LabelFrame(parent, text="Status", padding=10)
         status_frame.pack(fill='both', expand=True, padx=10, pady=5)
