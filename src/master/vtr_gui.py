@@ -494,19 +494,21 @@ class VTRControlGUI(Node):
         self.end_pos_var = tk.StringVar(value="0.0")
         ttk.Entry(repeating_frame, textvariable=self.end_pos_var, width=15).grid(row=4, column=1, sticky='w', pady=2)
 
-        # Traversals
-        ttk.Label(repeating_frame, text="Traversals:").grid(row=5, column=0, sticky='w', pady=2)
-        self.traversals_var = tk.StringVar(value="1")
-        ttk.Entry(repeating_frame, textvariable=self.traversals_var, width=5).grid(row=5, column=1, sticky='w', pady=2)
-
         # Checkboxes
         self.null_cmd_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(repeating_frame, text="Null Commands",
-                       variable=self.null_cmd_var).grid(row=6, column=0, columnspan=2, sticky='w', pady=2)
+                       variable=self.null_cmd_var).grid(row=5, column=0, columnspan=2, sticky='w', pady=2)
 
-        self.use_dist_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(repeating_frame, text="Use Distance-Based Navigation",
-                       variable=self.use_dist_var).grid(row=7, column=0, columnspan=2, sticky='w', pady=2)
+        # Trajectory mode: when on, the repeater publishes the future local
+        # path (nav_msgs/Path on repeat/local_trajectory) for external
+        # trackers and does NOT send Twist to the controller.
+        self.publish_trajectory_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(repeating_frame, text="Publish trajectory (no Twist to controller)",
+                       variable=self.publish_trajectory_var).grid(row=6, column=0, columnspan=2, sticky='w', pady=2)
+
+        ttk.Label(repeating_frame, text="Trajectory horizon [m]:").grid(row=7, column=0, sticky='w', pady=2)
+        self.trajectory_horizon_var = tk.StringVar(value="3.0")
+        ttk.Entry(repeating_frame, textvariable=self.trajectory_horizon_var, width=5).grid(row=7, column=1, sticky='w', pady=2)
 
         # Image publish mode — constraint depends on the navigation_method
         # the robot is running: classic requires 0, pf2d requires >= 1.
@@ -1528,8 +1530,8 @@ class VTRControlGUI(Node):
         try:
             goal.start_pos = float(self.start_pos_var.get())
             goal.end_pos = float(self.end_pos_var.get())
-            goal.traversals = int(self.traversals_var.get())
             goal.image_pub = int(self.image_pub_var.get())
+            goal.trajectory_horizon = float(self.trajectory_horizon_var.get() or 0.0)
         except ValueError:
             self.log_status("ERROR: Invalid numeric values in fields!")
             return
@@ -1543,7 +1545,7 @@ class VTRControlGUI(Node):
 
         goal.map_name = self.repeat_map_name_var.get()
         goal.null_cmd = self.null_cmd_var.get()
-        goal.use_dist = self.use_dist_var.get()
+        goal.publish_trajectory = self.publish_trajectory_var.get()
         
         self.log_status(f"Sending REPEAT goal for map: {goal.map_name}")
         

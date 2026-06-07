@@ -1,11 +1,11 @@
 #goal definition
 float64 start_pos
 float64 end_pos
-uint8 traversals
 bool null_cmd
 uint8 image_pub
-bool use_dist
 string map_name
+bool publish_trajectory
+float64 trajectory_horizon
 ---
 #result definition
 bool success

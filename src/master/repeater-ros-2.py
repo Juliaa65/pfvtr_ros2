@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import time
+import math
 import threading
 
 import numpy as np
@@ -18,8 +19,9 @@ from rclpy.serialization import deserialize_message
 import rosbag2_py
 
 from sensor_msgs.msg import Image
-from geometry_msgs.msg import Twist, TwistStamped
+from geometry_msgs.msg import Twist, TwistStamped, PoseStamped
 from std_msgs.msg import Float32
+from nav_msgs.msg import Path, Odometry
 
 from cv_bridge import CvBridge
 
@@ -153,7 +155,20 @@ class RepeaterServer(Node):
         self.actions = []
         self.map_publish_span = 1
         self.map_transitions = []
-        self.use_distances = False
+
+        # Trajectory mode: when goal.publish_trajectory is set, the repeater
+        # stops handing Twist to the controller and instead publishes the
+        # upcoming recorded path (in base_link) for external trackers. The
+        # recorded odometry trajectory, keyed by distance, is loaded in
+        # parse_rosbag.
+        self.publish_trajectory = False
+        self.trajectory_horizon = 0.0
+        self.DEFAULT_TRAJ_HORIZON = 3.0
+        self.odom_dists = None
+        self.odom_x = None
+        self.odom_y = None
+        self.odom_yaw = None
+
         # Tolerance (m) for the goal-success trigger: the action succeeds once
         # `curr_dist >= map_end - distance_finish_offset`. The end-of-map
         # deceleration ramp in the controller is what produces the smooth
@@ -208,6 +223,12 @@ class RepeaterServer(Node):
             Float32, "repeat/distance_remaining", NAVIGATION_QOS
         )
 
+        # Future local trajectory (base_link frame) published in trajectory
+        # mode for external collision-free path trackers.
+        self.trajectory_pub = self.create_publisher(
+            Path, "repeat/local_trajectory", NAVIGATION_QOS
+        )
+
 
         self._action_server = ActionServer(
             self,
@@ -222,6 +243,10 @@ class RepeaterServer(Node):
 
 
     def setClockGain(self, req, resp):
+        # Retained as a no-op for API compatibility: the controller still calls
+        # this service when velocity_gain changes. clockGain was only consumed
+        # by the removed time-based replay (replay_timewise); it no longer
+        # affects distance-based replay.
         self.clockGain = req.gain
         return resp
 
@@ -326,7 +351,7 @@ class RepeaterServer(Node):
         # commanded velocity toward zero. Done *before* the finish check so
         # the controller gets an accurate near-zero value on the very tick
         # that triggers success.
-        if self.use_distances and len(self.map_distances) > self.curr_map:
+        if len(self.map_distances) > self.curr_map:
             remaining_msg = Float32()
             remaining_msg.data = float(
                 self.map_distances[self.curr_map][-1] - self.curr_dist
@@ -334,16 +359,19 @@ class RepeaterServer(Node):
             self.distance_remaining_pub.publish(remaining_msg)
 
         if (self.curr_dist >= (
-                self.map_distances[self.curr_map][-1] - self.distance_finish_offset) and self.use_distances) or \
+                self.map_distances[self.curr_map][-1] - self.distance_finish_offset)) or \
                 (self.endPosition != 0.0 and self.endPosition < self.curr_dist):
             self.get_logger().warn("GOAL REACHED, STOPPING REPEATER")
             self.isRepeating = False
-            if self.use_distances:
-                self.action_dists = []
-                self.actions = []
+            self.action_dists = []
+            self.actions = []
             self.shutdown()
 
-        if self.use_distances:
+        # Actuation: trajectory mode publishes the upcoming local path (no
+        # Twist → controller idles); otherwise replay the recorded Twist.
+        if self.publish_trajectory:
+            self._publish_trajectory()
+        else:
             self.play_closest_action()
 
         self.pubSensorsInput()
@@ -414,27 +442,44 @@ class RepeaterServer(Node):
         self.action_dists = []
         self.actions = []
 
+        # Recorded odometry trajectory, keyed by distance. The mapmaker writes
+        # /recorded_actions and /recorded_odometry consecutively at the same
+        # timestamp (mapmaker joy_cb), so each odometry pose pairs with the
+        # most recently seen action distance. Used by trajectory mode.
+        odom_samples = []  # (distance, x, y, yaw)
+        last_action_distance = None
+
         reader = self._open_bag2_reader(bag_uri)
         topics_info = reader.get_all_topics_and_types()
         type_by_name = {t.name: t.type for t in topics_info}
 
         while reader.has_next():
             topic, data, t_ns = reader.read_next()
-            if topic != "/recorded_actions":
-                continue
 
-            expected = "pfvtr/msg/DistancedTwist"
-            if type_by_name.get(topic, "") != expected:
-                raise RuntimeError(f"Unexpected type on {topic}: {type_by_name.get(topic,'')}")
+            if topic == "/recorded_actions":
+                expected = "pfvtr/msg/DistancedTwist"
+                if type_by_name.get(topic, "") != expected:
+                    raise RuntimeError(f"Unexpected type on {topic}: {type_by_name.get(topic,'')}")
 
+                msg = deserialize_message(data, DistancedTwist)
+                # Track distance for odom pairing *before* the null_cmd skip so
+                # the recorded path stays complete even across stationary spans.
+                last_action_distance = float(msg.distance)
 
-            msg = deserialize_message(data, DistancedTwist)
+                if self.null_cmd and msg.twist.linear.x < 0.01:
+                    continue
 
-            if self.null_cmd and msg.twist.linear.x < 0.01:
-                continue
+                self.action_dists.append(float(msg.distance))
+                self.actions.append(msg.twist)
 
-            self.action_dists.append(float(msg.distance))
-            self.actions.append(msg.twist)
+            elif topic == "/recorded_odometry" and last_action_distance is not None:
+                odom = deserialize_message(data, Odometry)
+                p = odom.pose.pose.position
+                q = odom.pose.pose.orientation
+                odom_samples.append(
+                    (last_action_distance, float(p.x), float(p.y),
+                     self._yaw_from_quat(q))
+                )
 
         # Convert to numpy array immediately after parsing
         if len(self.action_dists) > 0:
@@ -443,6 +488,29 @@ class RepeaterServer(Node):
         else:
             self.get_logger().warn("WARNING: No action commands found in rosbag!")
             self.action_dists = None
+
+        # Build distance-sorted odometry arrays for trajectory mode.
+        if len(odom_samples) > 0:
+            odom_samples.sort(key=lambda s: s[0])
+            arr = np.array(odom_samples, dtype=np.float64)
+            self.odom_dists = arr[:, 0]
+            self.odom_x = arr[:, 1]
+            self.odom_y = arr[:, 2]
+            self.odom_yaw = arr[:, 3]
+            self.get_logger().warn(f"Recorded odometry loaded ({len(odom_samples)} poses)")
+        else:
+            self.odom_dists = None
+            self.odom_x = None
+            self.odom_y = None
+            self.odom_yaw = None
+            self.get_logger().warn("No /recorded_odometry in bag — trajectory mode will publish empty paths.")
+
+    @staticmethod
+    def _yaw_from_quat(q):
+        return math.atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        )
 
     def _publish_vel(self, twist: Twist):
         # Wrap the stored plain Twist (from DistancedTwist.twist) in a
@@ -471,57 +539,73 @@ class RepeaterServer(Node):
             self._publish_vel(Twist())
 
 
-    def replay_timewise(self, bag_uri: str):
-        self.get_logger().warn("Starting")
-        previousMessageTime = None
-        expectedMessageTime = None
-        start = self.get_clock().now()
+    def _publish_trajectory(self):
+        # Publish the upcoming recorded teach path as a base_link-frame Path,
+        # for external trajectory trackers. Poses are the recorded odometry
+        # ahead of curr_dist (up to trajectory_horizon), expressed relative to
+        # the recorded pose at curr_dist (== where the robot is now, assuming
+        # good localization). Pure recorded data; no live TF.
+        path = Path()
+        path.header.stamp = self.get_clock().now().to_msg()
+        path.header.frame_id = "base_link"
 
-        reader = self._open_bag2_reader(bag_uri)
-        topics_info = reader.get_all_topics_and_types()
-        type_by_name = {t.name: t.type for t in topics_info}
+        if self.odom_dists is None or len(self.odom_dists) == 0:
+            self.trajectory_pub.publish(path)
+            return
 
-        while reader.has_next():
-            topic, data, t_ns = reader.read_next()
+        # Reference pose at curr_dist (linear interp between bracketing samples).
+        rx, ry, ryaw = self._interp_pose(self.curr_dist)
 
-            now = self.get_clock().now()
-            ts = rclpy.time.Time(nanoseconds=int(t_ns))
+        cos_r = math.cos(ryaw)
+        sin_r = math.sin(ryaw)
 
-            if previousMessageTime is None:
-                previousMessageTime = ts
-                expectedMessageTime = now
-            else:
-                simulatedTimeToGo = ts - previousMessageTime
-                corrected = rclpy.duration.Duration(nanoseconds=int(simulatedTimeToGo.nanoseconds * self.clockGain))
-                error = now - expectedMessageTime
-                sleepTime = corrected - error
-                expectedMessageTime = now + sleepTime
+        # First pose: the robot's current position = local origin.
+        path.poses.append(self._local_pose_stamped(0.0, 0.0, 0.0, path.header))
 
-                # rospy.sleep(sleepTime)
-                if sleepTime.nanoseconds > 0:
-                    time.sleep(sleepTime.nanoseconds / 1e9)
+        # Future recorded samples within the horizon.
+        mask = (self.odom_dists > self.curr_dist) & \
+               (self.odom_dists <= self.curr_dist + self.trajectory_horizon)
+        idxs = np.nonzero(mask)[0]
+        for i in idxs:
+            dx = float(self.odom_x[i]) - rx
+            dy = float(self.odom_y[i]) - ry
+            lx = cos_r * dx + sin_r * dy
+            ly = -sin_r * dx + cos_r * dy
+            lyaw = float(self.odom_yaw[i]) - ryaw
+            path.poses.append(self._local_pose_stamped(lx, ly, lyaw, path.header))
 
-                previousMessageTime = ts
+        self.trajectory_pub.publish(path)
 
-            if topic == "/recorded_actions":
-                expected = "pfvtr/msg/DistancedTwist"
-                if type_by_name.get(topic, "") != expected:
-                    raise RuntimeError(f"Unexpected type on {topic}: {type_by_name.get(topic,'')}")
-                msg = deserialize_message(data, DistancedTwist)
-                self._publish_vel(msg.twist)
-            else:
+    def _interp_pose(self, dist):
+        # Linear interpolation of (x, y, yaw) at `dist` over the sorted recorded
+        # odometry. yaw uses shortest-angle interpolation. Clamps at the ends.
+        d = self.odom_dists
+        if dist <= d[0]:
+            return float(self.odom_x[0]), float(self.odom_y[0]), float(self.odom_yaw[0])
+        if dist >= d[-1]:
+            return float(self.odom_x[-1]), float(self.odom_y[-1]), float(self.odom_yaw[-1])
+        hi = int(np.searchsorted(d, dist))
+        lo = hi - 1
+        span = d[hi] - d[lo]
+        t = 0.0 if span <= 0.0 else (dist - d[lo]) / span
+        x = float(self.odom_x[lo]) + t * (float(self.odom_x[hi]) - float(self.odom_x[lo]))
+        y = float(self.odom_y[lo]) + t * (float(self.odom_y[hi]) - float(self.odom_y[lo]))
+        dyaw = math.atan2(
+            math.sin(float(self.odom_yaw[hi]) - float(self.odom_yaw[lo])),
+            math.cos(float(self.odom_yaw[hi]) - float(self.odom_yaw[lo])),
+        )
+        yaw = float(self.odom_yaw[lo]) + t * dyaw
+        return x, y, yaw
 
-                pass
-
-            if self.isRepeating is False:
-                self.get_logger().info("stopped!")
-                break
-
-            self.checkShutdown()
-
-        self.isRepeating = False
-        dur = self.get_clock().now() - start
-        self.get_logger().warn("Rosbag runtime: %f" % (dur.nanoseconds / 1e9))
+    def _local_pose_stamped(self, x, y, yaw, header):
+        ps = PoseStamped()
+        ps.header = header
+        ps.pose.position.x = float(x)
+        ps.pose.position.y = float(y)
+        ps.pose.position.z = 0.0
+        ps.pose.orientation.z = math.sin(yaw / 2.0)
+        ps.pose.orientation.w = math.cos(yaw / 2.0)
+        return ps
 
 
     def actionCB(self, goal_handle):
@@ -552,6 +636,16 @@ class RepeaterServer(Node):
         self.nextStep = 0
         self.null_cmd = goal.null_cmd
 
+        # Trajectory mode: publish the future local path instead of Twist.
+        self.publish_trajectory = bool(goal.publish_trajectory)
+        h = float(goal.trajectory_horizon)
+        self.trajectory_horizon = h if h > 0.0 else self.DEFAULT_TRAJ_HORIZON
+        if self.publish_trajectory:
+            self.get_logger().warn(
+                f"Trajectory mode ON — publishing local path (horizon "
+                f"{self.trajectory_horizon} m) instead of Twist."
+            )
+
 
         self.map_images = []
         self.map_distances = []
@@ -574,7 +668,6 @@ class RepeaterServer(Node):
 
         self.get_logger().warn("Starting repeat")
         self.mapName = goal.map_name
-        self.use_distances = goal.use_dist
 
 
         bag_uri = _map_path(map_name, "bag")
@@ -588,16 +681,18 @@ class RepeaterServer(Node):
         self.curr_dist = float(goal.start_pos)
         time.sleep(2)
 
-        if self.use_distances:
-            self.parse_rosbag(bag_uri)
+        # Distance-based replay is the only mode. parse_rosbag loads both the
+        # recorded Twist actions and the recorded odometry trajectory.
+        self.parse_rosbag(bag_uri)
 
         self.get_logger().info("Repeating started!")
         self.isRepeating = True
 
-        if self.use_distances:
-            self.play_closest_action()
+        # Initial actuation kick (distanceCB then keeps it going).
+        if self.publish_trajectory:
+            self._publish_trajectory()
         else:
-            self.replay_timewise(bag_uri)
+            self.play_closest_action()
 
         while self.isRepeating:
             time.sleep(1)
