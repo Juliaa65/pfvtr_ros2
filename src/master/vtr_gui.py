@@ -551,6 +551,17 @@ class VTRControlGUI(Node):
         kill_frame = ttk.Frame(parent)
         kill_frame.pack(fill='x', padx=10, pady=(8, 8))
 
+        # tmux sessions this button can tear down. Created by local_run.sh /
+        # eval_local.sh (testbed) and the legacy testing session.
+        self._kill_sessions = ("testbed", "testing")
+
+        # The kill button only makes sense when the stack runs locally inside a
+        # tmux session this machine can see. When only gui.launch runs on a
+        # remote laptop there is no such session, so disable the button. This
+        # is checked ONCE at startup (the deployment topology doesn't change
+        # mid-session), avoiding any polling overhead.
+        self._local_kill_session = self._find_local_kill_session()
+
         self.kill_btn = tk.Button(
             kill_frame,
             text="KILL EVERYTHING",
@@ -563,8 +574,27 @@ class VTRControlGUI(Node):
             height=2,
             relief="raised",
             bd=3,
+            state="normal" if self._local_kill_session else "disabled",
         )
         self.kill_btn.pack(fill='x')
+
+    def _find_local_kill_session(self):
+        # Return the first of self._kill_sessions that exists locally, else
+        # None. `tmux has-session` exits 0 if the session exists.
+        for session in self._kill_sessions:
+            try:
+                rc = subprocess.run(
+                    ["tmux", "has-session", "-t", session],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                ).returncode
+            except FileNotFoundError:
+                # tmux not installed (e.g. remote laptop) — nothing to kill.
+                return None
+            if rc == 0:
+                return session
+        return None
 
     def _kill_everything(self):
         # Destructive: confirm first. Kills the known launch sessions; this
@@ -593,11 +623,10 @@ class VTRControlGUI(Node):
         # own session so it is NOT signalled by the pane teardown and finishes
         # killing every session even after this GUI has exited. The short
         # sleep lets os._exit() below complete first.
-        kill_script = (
-            "sleep 0.3; "
-            "tmux kill-session -t testbed 2>/dev/null; "
-            "tmux kill-session -t testing 2>/dev/null"
+        kills = "; ".join(
+            f"tmux kill-session -t {s} 2>/dev/null" for s in self._kill_sessions
         )
+        kill_script = f"sleep 0.3; {kills}"
         try:
             subprocess.Popen(
                 ["bash", "-c", kill_script],
