@@ -38,7 +38,10 @@ class Controller:
         else:
             decel_scale = 1.0
         out = Twist()
-        out.linear.x = base_x * decel_scale
+        if decel_scale == 1.0:
+            out.linear.x = base_x
+        else:
+            out.linear.x = max(base_x * decel_scale, 0.1)
         out.linear.y = msg.linear.y * self.velocityGain
         out.linear.z = msg.linear.z * self.velocityGain
         out.angular.x = msg.angular.x * self.turnGain

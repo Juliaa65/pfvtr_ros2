@@ -466,7 +466,7 @@ class RepeaterServer(Node):
                 # the recorded path stays complete even across stationary spans.
                 last_action_distance = float(msg.distance)
 
-                if self.null_cmd and msg.twist.linear.x < 0.01:
+                if self.null_cmd and msg.twist.linear.x <= 0.02:
                     continue
 
                 self.action_dists.append(float(msg.distance))
