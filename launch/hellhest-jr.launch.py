@@ -43,8 +43,8 @@ def generate_launch_description():
         description="nav_msgs/Odometry for distance fusion (sensors node)",
     )
 
-    additional_record_topics = DeclareLaunchArgument(
-        "additional_record_topics",
+    odom_record_topic = DeclareLaunchArgument(
+        "odom_record_topic",
         default_value="/odom",
         description="Odometry topic for mapmaker bag /recorded_odometry",
     )
@@ -140,7 +140,7 @@ def generate_launch_description():
                     "camera_topic": lc("camera_topic"),
                     "camera_back_topic": lc("camera_back_topic"),
                     "cmd_vel_topic": lc("cmd_vel_sub"),
-                    "additional_record_topics": lc("additional_record_topics"),
+                    "odom_record_topic": lc("odom_record_topic"),
                 }],
             ),
 
@@ -174,7 +174,7 @@ def generate_launch_description():
         cmd_vel_pub,
         cmd_vel_sub,
         odom_topic,
-        additional_record_topics,
+        odom_record_topic,
         particle_num,
         odom_error,
         dist_init_std,

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import math
+
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
@@ -6,6 +8,7 @@ from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rcl_interfaces.msg import SetParametersResult
 
 from geometry_msgs.msg import Twist, TwistStamped
+from nav_msgs.msg import Path
 from std_msgs.msg import Float32
 from pfvtr.msg import SensorsOutput
 from pfvtr.srv import SetClockGain
@@ -54,6 +57,20 @@ class ControllerNode(Node):
             self.callbackDistanceRemaining, NAVIGATION_QOS,
             callback_group=cb_group,
         )
+
+        # Trajectory (path) mode: when the repeater publishes the upcoming
+        # recorded local path instead of a Twist (goal.publish_trajectory), the
+        # Twist branch idles (no map_vel). We instead apply the SAME visual
+        # correction (alignment * turn_gain) as an affine heading rotation of
+        # that base_link path and republish a visually-corrected path for the
+        # downstream stack. pfvtr is non-metric: turn_gain is the tuned
+        # proportional gain mapping visual displacement to the correction —
+        # here a heading angle, vs. an angular rate in Twist mode.
+        self.sub_path = self.create_subscription(
+            Path, "repeat/local_trajectory", self.callbackPath,
+            NAVIGATION_QOS, callback_group=cb_group)
+        self.path_pub = self.create_publisher(
+            Path, "repeat/local_trajectory_corrected", NAVIGATION_QOS)
 
         self.gain_client = self.create_client(SetClockGain, "set_clock_gain")
         self._apply_controller_params()
@@ -114,6 +131,30 @@ class ControllerNode(Node):
     def callbackDistanceRemaining(self, msg: Float32):
         self.c.set_distance_remaining(msg.data)
 
+    def callbackPath(self, msg: Path):
+        # Path mode: rotate the recorded future path rigidly about the
+        # base_link origin by delta = alignment * turn_gain (the same
+        # proportional VTR correction used in the Twist branch, applied here as
+        # a heading angle), then republish the visually-corrected path. Reuses
+        # the latest alignment from callbackCorr; both callbacks share the one
+        # callback group, so the read is serialized against the write.
+        delta = self.c.alignment * self.c.turnGain
+        cos_d = math.cos(delta)
+        sin_d = math.sin(delta)
+        for ps in msg.poses:
+            x = ps.pose.position.x
+            y = ps.pose.position.y
+            ps.pose.position.x = x * cos_d - y * sin_d
+            ps.pose.position.y = x * sin_d + y * cos_d
+            q = ps.pose.orientation
+            yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                             1.0 - 2.0 * (q.y * q.y + q.z * q.z)) + delta
+            q.x = 0.0
+            q.y = 0.0
+            q.z = math.sin(yaw * 0.5)
+            q.w = math.cos(yaw * 0.5)
+        self.path_pub.publish(msg)
+
     def callbackReconfigure(self, params):
         overrides = {}
         for p in params:
@@ -159,3 +200,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
