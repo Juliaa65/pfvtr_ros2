@@ -202,6 +202,10 @@ class PF2D(SensorFusion):
         self.map = 0
         self.last_map_transition_time = self._clock.now()
         self.map_num = 1
+        # Furthest distance in the current lookaround window; updated each
+        # abs_alignment step so the KDE grid can reach the visible tail even
+        # when particles cluster just below it.
+        self._max_visible_dist = None
 
         self._min_align_noise = 0.01
         self._map_trans_time = 5.0
@@ -358,6 +362,7 @@ class PF2D(SensorFusion):
             map_trans = [map_trans[trans_per_map * map_idx:trans_per_map * (map_idx + 1)] for map_idx in range(self.map_num)]
             hists = [hists[len_per_map * map_idx:len_per_map * (map_idx + 1)] for map_idx in range(self.map_num)]
             dists = np.array([dists[len_per_map * map_idx:len_per_map * (map_idx + 1)] for map_idx in range(self.map_num)])
+            self._max_visible_dist = float(np.max(dists[:, -1]))
             timestamps = [timestamps[len_per_map * map_idx:len_per_map * (map_idx + 1)] for map_idx in range(self.map_num)]
             time_diffs = [self._get_time_diff(timestamps[map_idx]) for map_idx in range(self.map_num)]
             if self.map_num > 1:
@@ -466,7 +471,18 @@ class PF2D(SensorFusion):
                 interp_f = interpolate.RectBivariateSpline(
                     dists[map_idx], np.linspace(-1.0, 1.0, hist_width), hists[map_idx], kx=1
                 )
-                particle_prob[map_particle_mask] = interp_f(map_masked_particles[0], map_masked_particles[1], grid=False)
+                # Evaluate likelihood at the nearest in-map distance. Particles
+                # pushed past the last image by odometry would otherwise get
+                # extrapolated (often negative) weight and be killed on resample,
+                # capping the published distance below the visible tail.
+                eval_d = np.clip(
+                    map_masked_particles[0],
+                    dists[map_idx][0],
+                    dists[map_idx][-1],
+                )
+                particle_prob[map_particle_mask] = interp_f(
+                    eval_d, map_masked_particles[1], grid=False
+                )
 
             self.particle_prob = particle_prob
             self.particle_prob[self.particle_prob < 0] = 0.0   # lower than 0.0 probability - should not happen though
@@ -634,7 +650,11 @@ class PF2D(SensorFusion):
                 float(np.sum(particles[0] * weights)),
                 float(np.sum(particles[1] * weights)),
             ))
-        grid_d = np.linspace(particles[0].min(), particles[0].max(), self._kde_grid_res)
+        d_min = float(particles[0].min())
+        d_max = float(particles[0].max())
+        if self._max_visible_dist is not None:
+            d_max = max(d_max, self._max_visible_dist)
+        grid_d = np.linspace(d_min, d_max, self._kde_grid_res)
         grid_a = np.linspace(-1.0, 1.0, self._kde_grid_res)
         DD, AA = np.meshgrid(grid_d, grid_a, indexing="ij")
         density = kde(np.vstack([DD.ravel(), AA.ravel()])).reshape(DD.shape)
