@@ -188,6 +188,9 @@ class RepeaterServer(Node):
         self.last_closest_action_idx = -1
 
         self._active_goal_handle = None
+        # After goal success, keep publishing distance_remaining=0 so downstream
+        # trackers/controllers see a held-at-goal signal until the next repeat.
+        self._goal_distance_timer = None
 
 
         self.get_logger().debug("Waiting for services to become available...")
@@ -252,8 +255,25 @@ class RepeaterServer(Node):
 
     def stopService(self, req, resp):
         self.isRepeating = False
+        self._stop_goal_distance_pub()
         self.get_logger().warn("Received stop request!")
         return resp
+
+    def _publish_distance_remaining(self, value: float) -> None:
+        msg = Float32()
+        msg.data = float(value)
+        self.distance_remaining_pub.publish(msg)
+
+    def _start_goal_distance_pub(self) -> None:
+        self._stop_goal_distance_pub()
+        self._goal_distance_timer = self.create_timer(
+            0.1, lambda: self._publish_distance_remaining(0.0)
+        )
+
+    def _stop_goal_distance_pub(self) -> None:
+        if self._goal_distance_timer is not None:
+            self._goal_distance_timer.cancel()
+            self._goal_distance_timer = None
 
     def getMapsService(self, req, resp):
         # Source of truth for available maps lives on whichever machine
@@ -352,16 +372,16 @@ class RepeaterServer(Node):
         # the controller gets an accurate near-zero value on the very tick
         # that triggers success.
         if len(self.map_distances) > self.curr_map:
-            remaining_msg = Float32()
-            remaining_msg.data = float(
+            self._publish_distance_remaining(
                 self.map_distances[self.curr_map][-1] - self.curr_dist
             )
-            self.distance_remaining_pub.publish(remaining_msg)
 
         if (self.curr_dist >= (
                 self.map_distances[self.curr_map][-1] - self.distance_finish_offset)) or \
                 (self.endPosition != 0.0 and self.endPosition < self.curr_dist):
             self.get_logger().warn("GOAL REACHED, STOPPING REPEATER")
+            self._publish_distance_remaining(0.0)
+            self._start_goal_distance_pub()
             self.isRepeating = False
             self.action_dists = []
             self.actions = []
@@ -425,6 +445,8 @@ class RepeaterServer(Node):
 
     def shutdown(self):
         self.isRepeating = False
+        # Goal-distance timer is started by distanceCB on success; keep it
+        # running so repeat/distance_remaining stays at 0 after the action ends.
 
     def _open_bag2_reader(self, bag_uri: str) -> rosbag2_py.SequentialReader:
         reader = rosbag2_py.SequentialReader()
@@ -686,6 +708,7 @@ class RepeaterServer(Node):
         self.parse_rosbag(bag_uri)
 
         self.get_logger().info("Repeating started!")
+        self._stop_goal_distance_pub()
         self.isRepeating = True
 
         # Initial actuation kick (distanceCB then keeps it going).
