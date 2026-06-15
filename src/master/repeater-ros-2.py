@@ -40,14 +40,7 @@ def get_exclusive_callback_group():
 
 
 
-# All maps live under a single workspace-relative directory.  Resolution
-# happens here; on-the-wire `map_name` (in actions and inside `params`) stays
-# a bare name.
-MAPS_DIR = "maps"
-
-
-def _map_path(name: str, *parts: str) -> str:
-    return os.path.join(MAPS_DIR, name, *parts)
+from maps_paths import map_path as _map_path, maps_dir
 
 
 _bridge = CvBridge()
@@ -157,11 +150,13 @@ class RepeaterServer(Node):
         self.map_transitions = []
 
         # Trajectory mode: when goal.publish_trajectory is set, the repeater
-        # stops handing Twist to the controller and instead publishes the
-        # upcoming recorded path (in base_link) for external trackers. The
-        # recorded odometry trajectory, keyed by distance, is loaded in
+        # publishes the upcoming recorded path (in base_link) for external
+        # trackers. use_cmd_vel independently controls replay of recorded
+        # Twist commands to map_vel. Both can be enabled at once.
+        # The recorded odometry trajectory, keyed by distance, is loaded in
         # parse_rosbag.
         self.publish_trajectory = False
+        self.use_cmd_vel = False
         self.trajectory_horizon = 0.0
         self.DEFAULT_TRAJ_HORIZON = 3.0
         self.odom_dists = None
@@ -280,9 +275,10 @@ class RepeaterServer(Node):
         # runs the repeater (the robot). The GUI calls this so it lists the
         # robot's maps over Zenoh, not its own local `maps/`.
         maps = []
-        if os.path.isdir(MAPS_DIR):
-            for item in sorted(os.listdir(MAPS_DIR)):
-                full = os.path.join(MAPS_DIR, item)
+        root = maps_dir()
+        if os.path.isdir(root):
+            for item in sorted(os.listdir(root)):
+                full = os.path.join(root, item)
                 if os.path.isdir(full) and os.path.exists(os.path.join(full, "params")):
                     maps.append(item)
         resp.maps = maps
@@ -387,11 +383,10 @@ class RepeaterServer(Node):
             self.actions = []
             self.shutdown()
 
-        # Actuation: trajectory mode publishes the upcoming local path (no
-        # Twist → controller idles); otherwise replay the recorded Twist.
+        # Actuation: trajectory and cmd_vel replay are independent.
         if self.publish_trajectory:
             self._publish_trajectory()
-        else:
+        if self.use_cmd_vel:
             self.play_closest_action()
 
         self.pubSensorsInput()
@@ -658,15 +653,23 @@ class RepeaterServer(Node):
         self.nextStep = 0
         self.null_cmd = goal.null_cmd
 
-        # Trajectory mode: publish the future local path instead of Twist.
+        # Trajectory / cmd_vel actuation flags (independent).
         self.publish_trajectory = bool(goal.publish_trajectory)
+        self.use_cmd_vel = bool(goal.use_cmd_vel)
+        # Legacy default: when both flags are false, replay recorded Twist only
+        # (same as the old publish_trajectory=false repeat mode).
+        if not self.publish_trajectory and not self.use_cmd_vel:
+            self.use_cmd_vel = True
+            self.get_logger().info(
+                "publish_trajectory and use_cmd_vel both false; "
+                "defaulting to Twist-only (legacy repeat)."
+            )
         h = float(goal.trajectory_horizon)
         self.trajectory_horizon = h if h > 0.0 else self.DEFAULT_TRAJ_HORIZON
-        if self.publish_trajectory:
-            self.get_logger().warn(
-                f"Trajectory mode ON — publishing local path (horizon "
-                f"{self.trajectory_horizon} m) instead of Twist."
-            )
+        self.get_logger().warn(
+            f"Repeat actuation: publish_trajectory={self.publish_trajectory}, "
+            f"use_cmd_vel={self.use_cmd_vel}, trajectory_horizon={self.trajectory_horizon} m"
+        )
 
 
         self.map_images = []
@@ -714,7 +717,7 @@ class RepeaterServer(Node):
         # Initial actuation kick (distanceCB then keeps it going).
         if self.publish_trajectory:
             self._publish_trajectory()
-        else:
+        if self.use_cmd_vel:
             self.play_closest_action()
 
         while self.isRepeating:

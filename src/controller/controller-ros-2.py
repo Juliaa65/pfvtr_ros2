@@ -58,14 +58,10 @@ class ControllerNode(Node):
             callback_group=cb_group,
         )
 
-        # Trajectory (path) mode: when the repeater publishes the upcoming
-        # recorded local path instead of a Twist (goal.publish_trajectory), the
-        # Twist branch idles (no map_vel). We instead apply the SAME visual
-        # correction (alignment * turn_gain) as an affine heading rotation of
-        # that base_link path and republish a visually-corrected path for the
-        # downstream stack. pfvtr is non-metric: turn_gain is the tuned
-        # proportional gain mapping visual displacement to the correction —
-        # here a heading angle, vs. an angular rate in Twist mode.
+        # Path and Twist branches are independent: the repeater may publish
+        # repeat/local_trajectory, map_vel, or both. When both are active,
+        # callbackPath applies VTR heading correction to the path while
+        # callbackVel processes recorded Twist as usual.
         self.sub_path = self.create_subscription(
             Path, "repeat/local_trajectory", self.callbackPath,
             NAVIGATION_QOS, callback_group=cb_group)

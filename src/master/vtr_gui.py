@@ -14,14 +14,7 @@ import numpy as np
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-# All maps live under this workspace-relative directory.  Resolution happens
-# here; on-the-wire `map_name` (in actions and inside `params`) stays a bare
-# name.
-MAPS_DIR = "maps"
-
-
-def _map_path(name, *parts):
-    return os.path.join(MAPS_DIR, name, *parts)
+from maps_paths import map_path as _map_path
 
 import rclpy
 from rclpy.node import Node
@@ -499,16 +492,19 @@ class VTRControlGUI(Node):
         ttk.Checkbutton(repeating_frame, text="Null Commands",
                        variable=self.null_cmd_var).grid(row=5, column=0, columnspan=2, sticky='w', pady=2)
 
-        # Trajectory mode: when on, the repeater publishes the future local
-        # path (nav_msgs/Path on repeat/local_trajectory) for external
-        # trackers and does NOT send Twist to the controller.
+        # Trajectory: publish future local path for external trackers.
         self.publish_trajectory_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(repeating_frame, text="Publish trajectory (no Twist to controller)",
+        ttk.Checkbutton(repeating_frame, text="Publish trajectory (for external tracker)",
                        variable=self.publish_trajectory_var).grid(row=6, column=0, columnspan=2, sticky='w', pady=2)
 
-        ttk.Label(repeating_frame, text="Trajectory horizon [m]:").grid(row=7, column=0, sticky='w', pady=2)
+        # Cmd_vel replay: publish recorded Twist to map_vel (independent of trajectory).
+        self.use_cmd_vel_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(repeating_frame, text="Replay recorded cmd_vel (map_vel)",
+                       variable=self.use_cmd_vel_var).grid(row=7, column=0, columnspan=2, sticky='w', pady=2)
+
+        ttk.Label(repeating_frame, text="Trajectory horizon [m]:").grid(row=8, column=0, sticky='w', pady=2)
         self.trajectory_horizon_var = tk.StringVar(value="3.0")
-        ttk.Entry(repeating_frame, textvariable=self.trajectory_horizon_var, width=5).grid(row=7, column=1, sticky='w', pady=2)
+        ttk.Entry(repeating_frame, textvariable=self.trajectory_horizon_var, width=5).grid(row=8, column=1, sticky='w', pady=2)
 
         # Image publish mode — constraint depends on the navigation_method
         # the robot is running: classic requires 0, pf2d requires >= 1.
@@ -523,17 +519,17 @@ class VTRControlGUI(Node):
             image_pub_default = "1"
             image_pub_state = "normal"
         self.image_pub_label = ttk.Label(repeating_frame, text=image_pub_label)
-        self.image_pub_label.grid(row=8, column=0, sticky='w', pady=2)
+        self.image_pub_label.grid(row=9, column=0, sticky='w', pady=2)
         self.image_pub_var = tk.StringVar(value=image_pub_default)
         self.image_pub_entry = ttk.Entry(repeating_frame, textvariable=self.image_pub_var,
                                          width=5, state=image_pub_state)
-        self.image_pub_entry.grid(row=8, column=1, sticky='w', pady=2)
+        self.image_pub_entry.grid(row=9, column=1, sticky='w', pady=2)
 
         # Send / Stop buttons.  STOP is not in `_gated_widgets` because it
         # has its own state machine driven by goal acceptance / completion,
         # mirroring how STOP MAPPING is handled.
         repeat_btn_frame = ttk.Frame(repeating_frame)
-        repeat_btn_frame.grid(row=9, column=0, columnspan=2, pady=10)
+        repeat_btn_frame.grid(row=10, column=0, columnspan=2, pady=10)
         self.send_repeat_btn = ttk.Button(repeat_btn_frame, text="SEND REPEAT COMMAND",
                                           command=self.send_repeating_goal,
                                           state='disabled')
@@ -1546,7 +1542,7 @@ class VTRControlGUI(Node):
         goal.map_name = self.repeat_map_name_var.get()
         goal.null_cmd = self.null_cmd_var.get()
         goal.publish_trajectory = self.publish_trajectory_var.get()
-        
+        goal.use_cmd_vel = self.use_cmd_vel_var.get()
         self.log_status(f"Sending REPEAT goal for map: {goal.map_name}")
         
         future = self.repeater_client.send_goal_async(

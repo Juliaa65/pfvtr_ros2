@@ -72,14 +72,7 @@ CAMERA_SYNC_QOS = QoSProfile(
 TARGET_WIDTH = 512
 
 
-# All maps live under a single workspace-relative directory so they don't
-# clutter the workspace root.  Resolution happens here; on-the-wire `map_name`
-# in actions and on disk inside `params` stays a bare name.
-MAPS_DIR = "maps"
-
-
-def _map_path(name: str, *parts: str) -> str:
-    return os.path.join(MAPS_DIR, name, *parts)
+from maps_paths import map_path as _map_path, maps_dir
 
 
 def get_map_dists(mappath: str) -> np.ndarray:
@@ -909,7 +902,7 @@ class MapmakerServer(Node):
                 self.mapStep = 1.0
 
             try:
-                os.makedirs(MAPS_DIR, exist_ok=True)
+                os.makedirs(maps_dir(), exist_ok=True)
                 map_dir = _map_path(goal.map_name)
                 # Never overwrite an existing map: archive it with a timestamp
                 # suffix and record a fresh one under the requested name.

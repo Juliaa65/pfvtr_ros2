@@ -5,6 +5,7 @@ bool null_cmd
 uint8 image_pub
 string map_name
 bool publish_trajectory
+bool use_cmd_vel
 float64 trajectory_horizon
 ---
 #result definition
