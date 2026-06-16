@@ -113,6 +113,38 @@ def _lookup_nearest(cache: Cache, stamp: Time, slop: Duration):
     return best_msg
 
 
+def _lookup_miss_info(cache: Cache, stamp: Time, slop: Duration) -> dict:
+    """Diagnostics when _lookup_nearest returns None."""
+    cache_size = len(cache.cache_msgs)
+    best_dt_ns = None
+    for msg_time in cache.cache_times:
+        dt_ns = abs((msg_time - stamp).nanoseconds)
+        if best_dt_ns is None or dt_ns < best_dt_ns:
+            best_dt_ns = dt_ns
+    slop_sec = float(slop.nanoseconds) / 1e9
+    if cache_size == 0:
+        return {
+            "cache_size": 0,
+            "best_dt_sec": None,
+            "slop_sec": slop_sec,
+            "reason": "topic silent (cache empty)",
+        }
+    best_dt_sec = float(best_dt_ns) / 1e9
+    if best_dt_sec > slop_sec:
+        return {
+            "cache_size": cache_size,
+            "best_dt_sec": best_dt_sec,
+            "slop_sec": slop_sec,
+            "reason": f"stamp skew {best_dt_sec:.3f}s > slop {slop_sec:.3f}s",
+        }
+    return {
+        "cache_size": cache_size,
+        "best_dt_sec": best_dt_sec,
+        "slop_sec": slop_sec,
+        "reason": "no match in cache (unknown)",
+    }
+
+
 def save_img(img_repr, image_msg: Image, header: Header, map_name: str,
              curr_dist, curr_hist, curr_align, source_map, save_img_flag: bool,
              bridge: CvBridge):
@@ -180,13 +212,14 @@ class MapmakerServer(Node):
         self.curr_hist = None
         self.last_saved_dist = None
         self.last_action_dist = 0.0
-        self.action_dist_step = 0.01
+        self.action_dist_step = 0.0001
         self.save_imgs = False
         self.header = None
         self.target_distances = None
         self.collected_distances = None
         self.dist = 0.0
         self.lastOdom = None
+        self.lastGpsOdom = None
         self.curr_alignment = None
         self.source_map = None
         self.align_future = None
@@ -194,6 +227,7 @@ class MapmakerServer(Node):
 
         self.declare_parameter("cmd_vel_topic", "/bluetooth_teleop/cmd_vel")
         self.declare_parameter("odom_record_topic", "/odometry_publisher")
+        self.declare_parameter("gps_record_topic", "")
         self.declare_parameter("camera_topic", "/camera_front_publisher")
         self.declare_parameter("camera_transport", "raw")
         # Empty string means "no rear camera configured" — backward mapping
@@ -205,10 +239,18 @@ class MapmakerServer(Node):
         self.declare_parameter("teach_dist_cache_size", 1000)
         self.declare_parameter("teach_cam_cache_size", 10)
         self.declare_parameter("teach_lookup_slop_sec", 1.5)
+        self.declare_parameter("record_debug", True)
+        self.declare_parameter("record_debug_period_sec", 5.0)
+        self.declare_parameter("teach_repr_trace", True)
+        self.declare_parameter("teach_repr_log_every", 1)
+        self.declare_parameter("teach_feed_watchdog_sec", 3.0)
 
         self.joy_topic = self.get_parameter("cmd_vel_topic").value
         self.cmd_vel_topic = self.get_parameter("cmd_vel_topic").value
         self.odom_record_topic = self.get_parameter("odom_record_topic").value
+        self.gps_record_topic = (
+            self.get_parameter("gps_record_topic").value or ""
+        ).strip()
         self.camera_topic = self.get_parameter("camera_topic").value
         self._camera_transport_param = self.get_parameter("camera_transport").value
         self.camera_back_topic = (
@@ -222,16 +264,26 @@ class MapmakerServer(Node):
         self._teach_dist_cache_size = int(self.get_parameter("teach_dist_cache_size").value)
         self._teach_cam_cache_size = int(self.get_parameter("teach_cam_cache_size").value)
         self._teach_lookup_slop_sec = float(self.get_parameter("teach_lookup_slop_sec").value)
+        self._record_debug = bool(self.get_parameter("record_debug").value)
+        self._record_debug_period_ns = int(
+            float(self.get_parameter("record_debug_period_sec").value) * 1e9)
+        self._teach_repr_trace = bool(self.get_parameter("teach_repr_trace").value)
+        self._teach_repr_log_every = max(
+            1, int(self.get_parameter("teach_repr_log_every").value))
+        self._teach_feed_watchdog_sec = float(
+            self.get_parameter("teach_feed_watchdog_sec").value)
 
         self._backward_record = False
+        self._reset_record_debug_stats()
         self._active_map_dir = ""
         self._teach_msg_filter_subs = []
         self._repr_sub = None
         self._dist_cache = None
         self._cam_cache = None
         self.synced_topics = None
-
-
+        self._repr_trace_fp = None
+        self._teach_feed_watchdog_timer = None
+        self._teach_watchdog_last_repr_recv = 0
         self.get_logger().info("Waiting for services to become available...")
 
         self.distance_reset_cli = self.create_client(SetDist, "teach/set_dist")
@@ -274,6 +326,10 @@ class MapmakerServer(Node):
         if self.odom_record_topic:
             self.add_sub = self.create_subscription(Odometry, self.odom_record_topic, self.misc_cb, NAVIGATION_QOS)
 
+        if self.gps_record_topic:
+            self.gps_sub = self.create_subscription(
+                Odometry, self.gps_record_topic, self._gps_cb, NAVIGATION_QOS)
+
         self.get_logger().debug("Starting mapmaker action server")
         self._action_server = ActionServer(
             self,
@@ -286,7 +342,7 @@ class MapmakerServer(Node):
 
         self.get_logger().warn("Mapmaker starting subscribers")
         self._setup_teach_sync()
-
+        self._log_teach_topic_banner("init")
 
         self._bag_writer = None
         self._bag_open = False
@@ -411,6 +467,136 @@ class MapmakerServer(Node):
             self._repr_cb,
             SYNC_QOS,
         )
+        self._log_teach_topic_banner("setup_teach_sync")
+
+    def _fq_topic(self, relative: str) -> str:
+        """Fully-qualified topic name for this node's namespace."""
+        rel = relative if relative.startswith("/") else relative
+        ns = self.get_namespace().rstrip("/")
+        if not ns or ns == "/":
+            return rel if rel.startswith("/") else f"/{rel}"
+        if rel.startswith("/"):
+            return rel
+        return f"{ns}/{rel}"
+
+    def _teach_feed_topics(self) -> dict:
+        return {
+            "namespace": self.get_namespace(),
+            "live_representation": self._fq_topic("live_representation"),
+            "teach_output_dist": self._fq_topic("teach/output_dist"),
+            "camera": self.camera_topic,
+            "set_camera_service": self._fq_topic("set_camera_topic"),
+            "representations_hint": self._fq_topic("representations"),
+        }
+
+    def _repr_sub_publisher_count(self) -> int:
+        if self._repr_sub is None:
+            return -1
+        try:
+            return self._repr_sub.get_publisher_count()
+        except Exception:
+            return -1
+
+    def _log_teach_topic_banner(self, where: str) -> None:
+        t = self._teach_feed_topics()
+        repr_pubs = self._repr_sub_publisher_count()
+        peer = "pfvtr_map" if "pfvtr_map" in t["namespace"] else "pfvtr"
+        other = "pfvtr" if peer == "pfvtr_map" else "pfvtr_map"
+        self.get_logger().warn(
+            f"[teach_topics/{where}] node={self.get_fully_qualified_name()} "
+            f"namespace={t['namespace']!r} | "
+            f"SUB repr={t['live_representation']} (pubs={repr_pubs}) | "
+            f"SUB dist={t['teach_output_dist']} | "
+            f"SUB camera={t['camera']} ({self._camera_transport}) | "
+            f"SVC set_camera={t['set_camera_service']} | "
+            f"rear={self.camera_back_topic!r} default_front={self._default_camera_topic!r} | "
+            f"CHECK: rear map ({peer}) needs hz on {t['live_representation']} "
+            f"NOT /{other}/live_representation"
+        )
+        if repr_pubs == 0:
+            self.get_logger().error(
+                f"[teach_topics/{where}] NO PUBLISHER on {t['live_representation']} — "
+                f"mapmaker will never receive live_representation. "
+                f"Is {t['namespace']}/representations running? "
+                f"(ros2 topic hz {t['live_representation']})"
+            )
+
+    def _open_repr_trace(self, map_name: str) -> None:
+        self._close_repr_trace()
+        if not self._teach_repr_trace:
+            return
+        try:
+            trace_path = _map_path(map_name, "teach_repr_trace.log")
+            self._repr_trace_fp = open(trace_path, "a", encoding="utf-8")
+            t = self._teach_feed_topics()
+            self._repr_trace_fp.write(
+                f"# teach start {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                f"map={map_name!r} backward={self._backward_record}\n"
+                f"# repr={t['live_representation']} dist={t['teach_output_dist']} "
+                f"camera={t['camera']}\n"
+            )
+            self._repr_trace_fp.flush()
+            self.get_logger().warn(f"[teach_repr_trace] writing -> {trace_path}")
+        except Exception as e:
+            self.get_logger().error(f"[teach_repr_trace] cannot open trace file: {e}")
+            self._repr_trace_fp = None
+
+    def _close_repr_trace(self) -> None:
+        if self._repr_trace_fp is not None:
+            try:
+                self._repr_trace_fp.write(
+                    f"# teach end {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                    f"repr_recv={self._teach_sync_stats.get('repr_recv', 0)} "
+                    f"sync_ok={self._teach_sync_stats.get('sync_ok', 0)}\n"
+                )
+                self._repr_trace_fp.flush()
+                self._repr_trace_fp.close()
+            except Exception:
+                pass
+            self._repr_trace_fp = None
+
+    def _repr_trace_write(self, line: str) -> None:
+        if self._repr_trace_fp is None:
+            return
+        try:
+            self._repr_trace_fp.write(line + "\n")
+            self._repr_trace_fp.flush()
+        except Exception as e:
+            self.get_logger().error(f"[teach_repr_trace] write failed: {e}")
+
+    def _start_teach_feed_watchdog(self) -> None:
+        self._stop_teach_feed_watchdog()
+        self._teach_watchdog_last_repr_recv = 0
+        period = max(0.5, self._teach_feed_watchdog_sec)
+        self._teach_feed_watchdog_timer = self.create_timer(
+            period, self._teach_feed_watchdog_cb)
+
+    def _stop_teach_feed_watchdog(self) -> None:
+        if self._teach_feed_watchdog_timer is not None:
+            try:
+                self._teach_feed_watchdog_timer.cancel()
+                self.destroy_timer(self._teach_feed_watchdog_timer)
+            except Exception:
+                pass
+            self._teach_feed_watchdog_timer = None
+
+    def _teach_feed_watchdog_cb(self) -> None:
+        if not self.isMapping:
+            return
+        recv = self._teach_sync_stats['repr_recv']
+        t = self._teach_feed_topics()
+        repr_pubs = self._repr_sub_publisher_count()
+        dist_n, cam_n = self._teach_cache_sizes()
+        if recv == self._teach_watchdog_last_repr_recv:
+            self.get_logger().error(
+                f"[teach_feed_watchdog] NO live_representation at mapmaker "
+                f"since last {self._teach_feed_watchdog_sec:.1f}s | "
+                f"expecting {t['live_representation']} pubs={repr_pubs} | "
+                f"repr.recv={recv} sync_ok={self._teach_sync_stats['sync_ok']} | "
+                f"dist_cache={dist_n} cam_cache={cam_n} camera={t['camera']!r} | "
+                f"run: ros2 topic hz {t['live_representation']}"
+            )
+        self._teach_watchdog_last_repr_recv = recv
 
     def _warn_teach_lookup_throttled(self, message: str):
         now_ns = self.get_clock().now().nanoseconds
@@ -419,9 +605,50 @@ class MapmakerServer(Node):
         self._last_teach_lookup_warn_ns = now_ns
         self.get_logger().warn(message)
 
+    def _teach_cache_sizes(self) -> tuple:
+        dist_n = len(self._dist_cache.cache_msgs) if self._dist_cache is not None else 0
+        cam_n = len(self._cam_cache.cache_msgs) if self._cam_cache is not None else 0
+        return dist_n, cam_n
+
+    def _teach_sync_fail(self, kind: str, detail: str) -> None:
+        self._teach_sync_stats[kind] += 1
+        self._teach_sync_stats['last_fail'] = f"{kind}: {detail}"
+        self._warn_teach_lookup_throttled(f"Teach sync FAIL [{kind}] {detail}")
+
     def _repr_cb(self, repr_msg: FeaturesList):
+        self._teach_sync_stats['repr_recv'] += 1
+        n = self._teach_sync_stats['repr_recv']
+        dist_n, cam_n = self._teach_cache_sizes()
+        stamp_s = None
+        if hasattr(repr_msg, "header") and repr_msg.header is not None:
+            stamp_s = (
+                repr_msg.header.stamp.sec
+                + repr_msg.header.stamp.nanosec / 1e9
+            )
+
+        trace_line = (
+            f"repr#{n} stamp={stamp_s} mapping={self.isMapping} "
+            f"dist_cache={dist_n} cam_cache={cam_n} pf_dist={self.dist:.3f}"
+        )
+        self._repr_trace_write(trace_line)
+
+        if (self._teach_repr_log_every == 1
+                or n <= 10
+                or n % self._teach_repr_log_every == 0):
+            self.get_logger().info(
+                f"[teach_repr] {trace_line} topic={self._fq_topic('live_representation')}"
+            )
+
+        if self._record_debug and not self._first_repr_recv:
+            self._first_repr_recv = True
+            self._record_debug_log(
+                f'first live_representation #{n} dist_cache={dist_n} cam_cache={cam_n} '
+                f'camera={self.camera_topic!r} slop={self._teach_lookup_slop_sec:.2f}s '
+                f'topic={self._fq_topic("live_representation")}'
+            )
+
         if not hasattr(repr_msg, "header") or repr_msg.header is None:
-            self._warn_teach_lookup_throttled("Teach lookup: live_representation missing header")
+            self._teach_sync_fail('fail_no_header', 'live_representation missing header')
             return
 
         stamp = Time.from_msg(repr_msg.header.stamp)
@@ -429,25 +656,41 @@ class MapmakerServer(Node):
 
         dist_msg = _lookup_nearest(self._dist_cache, stamp, slop)
         if dist_msg is None:
-            self._warn_teach_lookup_throttled(
-                "Teach lookup: no teach/output_dist within slop of repr stamp"
+            miss = _lookup_miss_info(self._dist_cache, stamp, slop)
+            dist_n, cam_n = self._teach_cache_sizes()
+            self._teach_sync_fail(
+                'fail_no_dist',
+                f"teach/output_dist — {miss['reason']} "
+                f"(dist_cache={dist_n} cam_cache={cam_n} "
+                f"repr_stamp={stamp.nanoseconds / 1e9:.3f})",
             )
             return
 
         img_msg = _lookup_nearest(self._cam_cache, stamp, slop)
         if img_msg is None:
-            self._warn_teach_lookup_throttled(
-                "Teach lookup: no camera image within slop of repr stamp"
+            miss = _lookup_miss_info(self._cam_cache, stamp, slop)
+            dist_n, cam_n = self._teach_cache_sizes()
+            self._teach_sync_fail(
+                'fail_no_cam',
+                f"camera {self.camera_topic!r} — {miss['reason']} "
+                f"(dist_cache={dist_n} cam_cache={cam_n} "
+                f"repr_stamp={stamp.nanoseconds / 1e9:.3f})",
             )
             return
 
         img_msg = self._to_raw_image(img_msg)
         if img_msg is None:
-            self._warn_teach_lookup_throttled(
-                "Teach lookup: camera frame decode failed"
+            self._teach_sync_fail(
+                'fail_decode',
+                f"camera {self.camera_topic!r} transport={self._camera_transport!r}",
             )
             return
 
+        self._teach_sync_stats['sync_ok'] += 1
+        self._repr_trace_write(
+            f"  -> sync_ok#{self._teach_sync_stats['sync_ok']} "
+            f"dist={float(dist_msg.output):.3f} mapping={self.isMapping}"
+        )
         self.distance_img_cb(repr_msg, dist_msg, img_msg)
 
     async def _request_representations_camera(self, topic: str) -> bool:
@@ -469,8 +712,19 @@ class MapmakerServer(Node):
     async def _rebind_camera(self, topic: str):
         """Switch both representations' and mapmaker's camera subscription."""
         if topic == self._active_camera_topic:
+            self.get_logger().info(
+                f"Camera already on '{topic}' — skipping rebind"
+            )
             return
-        await self._request_representations_camera(topic)
+        ok = await self._request_representations_camera(topic)
+        if not ok:
+            self._bag_error_banner(
+                "REPRESENTATIONS CAMERA REBIND FAILED",
+                f"requested={topic!r} service={self._fq_topic('set_camera_topic')}",
+                "Mapmaker will subscribe to the camera locally but "
+                f"{self._fq_topic('representations')} may still be on the wrong camera — "
+                "live_representation may be stale or absent.",
+            )
         self.camera_topic = topic
         self._teardown_teach_sync()
         self._setup_teach_sync()
@@ -479,7 +733,8 @@ class MapmakerServer(Node):
             self._camera_transport_param, self.camera_topic
         )
         self.get_logger().warn(
-            f"Mapmaker camera rebound to '{topic}' ({self._camera_transport})"
+            f"Mapmaker camera rebound to '{topic}' ({self._camera_transport}) "
+            f"repr_rebind_ok={ok}"
         )
 
     def _setup_repeat_sync(self):
@@ -513,6 +768,10 @@ class MapmakerServer(Node):
         # is open.
         self.lastOdom = msg
 
+    def _gps_cb(self, msg: Odometry):
+        # Same caching rationale as misc_cb — consumed only while a bag is open.
+        self.lastGpsOdom = msg
+
     def distance_wrapper_cb(
         self,
         repr_msg: FeaturesList,
@@ -539,11 +798,13 @@ class MapmakerServer(Node):
         dist = float(dist_msg.output)
         self.dist = dist
         if not self.isMapping:
+            self._teach_sync_stats['skip_not_mapping'] += 1
             return
 
         # Flush repr frames still in flight from before isMapping flipped.
         # Their distance lookup can reflect pre teach/set_dist state.
         if self._startup_skip_count > 0:
+            self._teach_sync_stats['skip_startup'] += 1
             self._startup_skip_count -= 1
             return
 
@@ -568,6 +829,7 @@ class MapmakerServer(Node):
                     self.img_features, self.img_msg, self.header, self.mapName, dist,
                     self.curr_hist, self.curr_alignment, self.source_map, self.save_imgs, self.bridge
                 ))
+                self._note_kp_saved(dist)
                 self.get_logger().info(f"Saved waypoint: {dist}, {self.curr_trans}")
 
         # save after fixed distance OR visual turn threshold
@@ -578,20 +840,266 @@ class MapmakerServer(Node):
                 self.img_features, self.img_msg, self.header, self.mapName, dist,
                 self.curr_hist, self.curr_alignment, self.source_map, self.save_imgs, self.bridge
             ))
+            self._note_kp_saved(dist)
             self.get_logger().info(f"Saved waypoint: {dist}, {self.curr_trans}")
 
         if self.last_img_features is None:
             self.last_img_features = self.img_features
 
+        self._maybe_log_record_status('sync')
         self.checkShutdown()
+
+    def _reset_record_debug_stats(self) -> None:
+        self._joy_stats = {
+            'recv': 0,
+            'saved': 0,
+            'skip_no_bag': 0,
+            'skip_dist_low': 0,
+            'skip_dist_step': 0,
+        }
+        self._teach_sync_stats = {
+            'repr_recv': 0,
+            'sync_ok': 0,
+            'fail_no_header': 0,
+            'fail_no_dist': 0,
+            'fail_no_cam': 0,
+            'fail_decode': 0,
+            'skip_not_mapping': 0,
+            'skip_startup': 0,
+            'kp_queued': 0,
+            'last_fail': '',
+        }
+        self._last_kp_dist = 0.0
+        self._max_kp_dist = 0.0
+        self._max_action_dist = 0.0
+        self._last_action_vx = 0.0
+        self._last_action_wz = 0.0
+        self._last_joy_vx = 0.0
+        self._last_joy_wz = 0.0
+        self._record_debug_last_log_ns = 0
+        self._first_joy_saved = False
+        self._first_joy_recv = False
+        self._first_repr_recv = False
+        self._warned_no_bag = False
+        self._warned_dist_stuck = False
+        self._bag_write_failures = 0
+
+    @staticmethod
+    def _error_banner(headline: str, *lines: str) -> str:
+        body = "".join(f"\n  {line}" for line in lines)
+        return (
+            "\n" + "!" * 72 +
+            f"\n  {headline}" +
+            body +
+            "\n" + "!" * 72
+        )
+
+    def _bag_error_banner(self, headline: str, *lines: str) -> None:
+        self.get_logger().error(self._error_banner(headline, *lines))
+
+    def _bag_write(self, topic: str, msg, stamp_ns: int) -> bool:
+        if self._bag_writer is None:
+            self._bag_error_banner(
+                "BAG WRITE FAILED — bag writer is not open",
+                f"topic={topic}",
+                f"map={self.mapName!r}",
+                "Recording is active but nothing can be saved to the bag.",
+            )
+            return False
+        try:
+            self._bag_writer.write(topic, serialize_message(msg), stamp_ns)
+            return True
+        except Exception as e:
+            self._bag_write_failures += 1
+            self._bag_error_banner(
+                f"BAG WRITE FAILED — could not write {topic}",
+                f"map={self.mapName!r}",
+                f"error={e}",
+            )
+            return False
+
+    def _record_debug_log(self, msg: str) -> None:
+        if self._record_debug:
+            self.get_logger().warn(f'[record] {msg}')
+
+    def _note_kp_saved(self, dist: float) -> None:
+        self._teach_sync_stats['kp_queued'] += 1
+        self._last_kp_dist = float(dist)
+        self._max_kp_dist = max(self._max_kp_dist, self._last_kp_dist)
+
+    def _maybe_log_record_status(self, where: str) -> None:
+        if not self._record_debug or not self.isMapping:
+            return
+        now_ns = self.get_clock().now().nanoseconds
+        if (now_ns - self._record_debug_last_log_ns) < self._record_debug_period_ns:
+            return
+        self._record_debug_last_log_ns = now_ns
+        pubs = 0
+        try:
+            pubs = self.joy_sub.get_publisher_count()
+        except Exception:
+            pass
+        s = self._joy_stats
+        ts = self._teach_sync_stats
+        dist_n, cam_n = self._teach_cache_sizes()
+        self.get_logger().warn(
+            f'[record/{where}] map={self.mapName!r} dist={self.dist:.2f}m '
+            f'last_act={self.last_action_dist:.2f}m last_kp={self._last_kp_dist:.2f}m '
+            f'gap_act={self.dist - self.last_action_dist:.2f}m '
+            f'gap_kp={self.dist - self._last_kp_dist:.2f}m | '
+            f'cmd_vel@{self.joy_topic} pubs={pubs} '
+            f'joy.recv={s["recv"]} saved={s["saved"]} '
+            f'skip(no_bag={s["skip_no_bag"]} dist_low={s["skip_dist_low"]} '
+            f'dist_step={s["skip_dist_step"]}) '
+            f'last_joy vx={self._last_joy_vx:+.3f} wz={self._last_joy_wz:+.3f} '
+            f'last_saved vx={self._last_action_vx:+.3f} wz={self._last_action_wz:+.3f} | '
+            f'teach repr.recv={ts["repr_recv"]} sync_ok={ts["sync_ok"]} '
+            f'kp_queued={ts["kp_queued"]} dist_cache={dist_n} cam_cache={cam_n} | '
+            f'teach_fail(hdr={ts["fail_no_header"]} dist={ts["fail_no_dist"]} '
+            f'cam={ts["fail_no_cam"]} decode={ts["fail_decode"]} '
+            f'skip_startup={ts["skip_startup"]})'
+        )
+
+    def _dump_record_summary(self, phase: str) -> None:
+        s = self._joy_stats
+        act_gap = float(self.dist) - float(self.last_action_dist)
+        kp_gap = float(self.dist) - float(self._last_kp_dist)
+        pubs = 0
+        try:
+            pubs = self.joy_sub.get_publisher_count()
+        except Exception:
+            pass
+        self.get_logger().warn(
+            f'[record/{phase}] SUMMARY map={self.mapName!r} '
+            f'pf_dist={self.dist:.3f}m max_kp={self._max_kp_dist:.3f}m '
+            f'max_action={self._max_action_dist:.3f}m | '
+            f'last_action={self.last_action_dist:.3f}m '
+            f'last_kp={self._last_kp_dist:.3f}m | '
+            f'END GAP action={act_gap:+.3f}m keypoint={kp_gap:+.3f}m | '
+            f'cmd_vel@{self.joy_topic} pubs={pubs} | '
+            f'joy.recv={s["recv"]} saved={s["saved"]} '
+            f'skip(no_bag={s["skip_no_bag"]} dist_low={s["skip_dist_low"]} '
+            f'dist_step={s["skip_dist_step"]}) | '
+            f'last_saved vx={self._last_action_vx:+.3f} wz={self._last_action_wz:+.3f}'
+        )
+        self._dump_teach_sync_summary(phase)
+        if act_gap > 0.05:
+            self.get_logger().error(
+                f'[record/{phase}] ACTIONS STOPPED {act_gap:.2f}m BEFORE PF DISTANCE '
+                f'(keypoints may continue; replay will miss this tail)'
+            )
+        if s['recv'] == 0:
+            self.get_logger().error(
+                f'[record/{phase}] NO cmd_vel RECEIVED on {self.joy_topic} '
+                f'during teach — check twist_mux / topic remap'
+            )
+        elif s['recv'] > 0 and s['saved'] == 0:
+            self._bag_error_banner(
+                "RECORDING FINISHED WITH EMPTY BAG — zero cmd_vel actions saved",
+                f"map={self.mapName!r} pf_dist={self.dist:.3f}m",
+                f"cmd_vel received {s['recv']}x but bag has no /recorded_actions",
+                f"skip_dist_low={s['skip_dist_low']} skip_dist_step={s['skip_dist_step']} "
+                f"skip_no_bag={s['skip_no_bag']}",
+                "Check teach/output_dist (PF distance stuck at 0?) and cmd_vel topic.",
+            )
+        elif s['saved'] == 0:
+            self._bag_error_banner(
+                "RECORDING FINISHED WITH EMPTY BAG — no /recorded_actions written",
+                f"map={self.mapName!r} pf_dist={self.dist:.3f}m",
+                "No cmd_vel was received during teach — bag contains no motion commands.",
+            )
+        if self._bag_write_failures > 0:
+            self._bag_error_banner(
+                "RECORDING HAD BAG WRITE FAILURES",
+                f"map={self.mapName!r} failed_writes={self._bag_write_failures}",
+                "The saved bag may be incomplete — inspect maps/<name>/bag/.",
+            )
+
+    def _dump_teach_sync_summary(self, phase: str) -> None:
+        ts = self._teach_sync_stats
+        dist_n, cam_n = self._teach_cache_sizes()
+        self.get_logger().warn(
+            f'[teach_sync/{phase}] SUMMARY repr.recv={ts["repr_recv"]} '
+            f'sync_ok={ts["sync_ok"]} kp_queued={ts["kp_queued"]} '
+            f'max_kp_dist={self._max_kp_dist:.3f}m pf_dist={self.dist:.3f}m | '
+            f'fail(hdr={ts["fail_no_header"]} dist={ts["fail_no_dist"]} '
+            f'cam={ts["fail_no_cam"]} decode={ts["fail_decode"]}) '
+            f'skip(not_mapping={ts["skip_not_mapping"]} startup={ts["skip_startup"]}) | '
+            f'feeds dist_cache={dist_n} cam_cache={cam_n} '
+            f'camera={self.camera_topic!r} slop={self._teach_lookup_slop_sec:.2f}s'
+        )
+        if ts['repr_recv'] == 0:
+            t = self._teach_feed_topics()
+            self._bag_error_banner(
+                "TEACH SYNC DEAD — zero live_representation received",
+                f"map={self.mapName!r} camera={self.camera_topic!r}",
+                f"namespace={t['namespace']!r} expected_repr={t['live_representation']}",
+                f"repr_pubs_at_stop={self._repr_sub_publisher_count()}",
+                "Mapmaker never got a repr frame — no .npy keypoints or PF dist updates.",
+                f"Check: ros2 topic hz {t['live_representation']} "
+                f"(NOT /pfvtr/live_representation if this is pfvtr_map).",
+                f"Check {t['namespace']}/representations is running and bound to {t['camera']}.",
+            )
+        elif ts['sync_ok'] == 0:
+            last = ts['last_fail'] or '(no detail)'
+            self._bag_error_banner(
+                "TEACH SYNC NEVER SUCCEEDED — repr arrived but dist/cam lookup always failed",
+                f"map={self.mapName!r} repr.recv={ts['repr_recv']}",
+                f"fail dist={ts['fail_no_dist']} cam={ts['fail_no_cam']} "
+                f"decode={ts['fail_decode']} hdr={ts['fail_no_header']}",
+                f"last_fail={last}",
+                f"feeds dist_cache={dist_n} cam_cache={cam_n}",
+                "Empty dist_cache -> teach/output_dist silent (sensors/odom).",
+                "Empty cam_cache -> camera topic silent or QoS mismatch.",
+                "stamp skew -> raise teach_lookup_slop_sec or fix clock sync.",
+            )
+        elif ts['kp_queued'] == 0 and self._max_kp_dist <= 0.0:
+            self._bag_error_banner(
+                "TEACH SYNC OK BUT NO KEYPOINTS QUEUED",
+                f"map={self.mapName!r} sync_ok={ts['sync_ok']} pf_dist={self.dist:.3f}m",
+                f"skip_startup={ts['skip_startup']} map_step={self.mapStep:.2f}m",
+                "Repr+cam+dist aligned but robot may not have moved map_step yet,",
+                "or distance stayed at 0 (teach/output_dist / odom not advancing).",
+            )
 
     def joy_cb(self, msg: TwistStamped):
         if self.isMapping:
+            self._joy_stats['recv'] += 1
+            self._last_joy_vx = float(msg.twist.linear.x)
+            self._last_joy_wz = float(msg.twist.angular.z)
+            if self._record_debug and not self._first_joy_recv:
+                self._first_joy_recv = True
+                pubs = 0
+                try:
+                    pubs = self.joy_sub.get_publisher_count()
+                except Exception:
+                    pass
+                self._record_debug_log(
+                    f'first cmd_vel while mapping on {self.joy_topic} '
+                    f'(pubs={pubs}) dist={self.dist:.3f}m '
+                    f'vx={self._last_joy_vx:+.3f} wz={self._last_joy_wz:+.3f}'
+                )
             if self._bag_writer is None:
+                self._joy_stats['skip_no_bag'] += 1
+                if not self._warned_no_bag:
+                    self._warned_no_bag = True
+                    self._bag_error_banner(
+                        "RECORDING ACTIVE BUT BAG IS NOT OPEN — cmd_vel will not be saved",
+                        f"map={self.mapName!r} topic={self.joy_topic}",
+                    )
                 return
-            if self.dist < 0.01:
+            if self.dist < 0.0:
+                self._joy_stats['skip_dist_low'] += 1
+                if not self._warned_dist_stuck:
+                    self._warned_dist_stuck = True
+                    self._bag_error_banner(
+                        "RECORDING ACTIVE BUT TEACH DISTANCE IS ZERO — bag writes blocked",
+                        f"map={self.mapName!r} pf_dist={self.dist:.3f}m",
+                        "Waiting for teach/output_dist to advance before saving cmd_vel/odom.",
+                        "No /recorded_actions or /recorded_odometry will be written until distance > 0.01 m.",
+                    )
                 return
-            
+
             dist_delta = self.dist - self.last_action_dist
             if dist_delta >= self.action_dist_step:
                 save_msg = DistancedTwist()
@@ -599,11 +1107,32 @@ class MapmakerServer(Node):
                 save_msg.distance = float(self.dist)
 
                 now_ns = self.get_clock().now().nanoseconds
-                self._bag_writer.write("/recorded_actions", serialize_message(save_msg), now_ns)
+                if not self._bag_write("/recorded_actions", save_msg, now_ns):
+                    return
                 self.last_action_dist = self.dist
+                self._max_action_dist = max(self._max_action_dist, self.last_action_dist)
+                self._last_action_vx = float(msg.twist.linear.x)
+                self._last_action_wz = float(msg.twist.angular.z)
+                self._joy_stats['saved'] += 1
+                if self._record_debug and not self._first_joy_saved:
+                    self._first_joy_saved = True
+                    self._record_debug_log(
+                        f'first action saved at dist={self.dist:.3f}m '
+                        f'vx={self._last_action_vx:+.3f} wz={self._last_action_wz:+.3f}'
+                    )
 
                 if self.lastOdom is not None:
-                    self._bag_writer.write("/recorded_odometry", serialize_message(self.lastOdom), now_ns)
+                    if not self._bag_write("/recorded_odometry", self.lastOdom, now_ns):
+                        self.get_logger().error(
+                            f"Action saved at dist={self.dist:.3f}m but "
+                            "/recorded_odometry write failed — bag may be mismatched"
+                        )
+
+                if self.lastGpsOdom is not None:
+                    self._bag_write("/recorded_gps", self.lastGpsOdom, now_ns)
+            else:
+                self._joy_stats['skip_dist_step'] += 1
+            self._maybe_log_record_status('joy')
 
     def goal_cb(self, goal_request):
         if goal_request.start:
@@ -618,8 +1147,9 @@ class MapmakerServer(Node):
     def cancel_cb(self, goal_handle):
         return CancelResponse.ACCEPT
 
-    def _bag_open_for_map(self, map_name: str):
+    def _bag_open_for_map(self, map_name: str) -> bool:
         bag_dir = _map_path(map_name, "bag")
+        t0 = time.perf_counter()
 
         storage_options = rosbag2_py.StorageOptions(
             uri=bag_dir,
@@ -631,24 +1161,51 @@ class MapmakerServer(Node):
             output_serialization_format="cdr"
         )
 
-        self._bag_writer = rosbag2_py.SequentialWriter()
-        self._bag_writer.open(storage_options, converter_options)
+        try:
+            self._bag_writer = rosbag2_py.SequentialWriter()
+            self._bag_writer.open(storage_options, converter_options)
 
-        # Register topics
-        self._bag_writer.create_topic(rosbag2_py.TopicMetadata(
-            id=0,
-            name="/recorded_actions",
-            type="pfvtr/msg/DistancedTwist",
-            serialization_format="cdr"
-        ))
-        self._bag_writer.create_topic(rosbag2_py.TopicMetadata(
-            id=0,
-            name="/recorded_odometry",
-            type="nav_msgs/msg/Odometry",
-            serialization_format="cdr"
-        ))
+            # Register topics
+            self._bag_writer.create_topic(rosbag2_py.TopicMetadata(
+                id=0,
+                name="/recorded_actions",
+                type="pfvtr/msg/DistancedTwist",
+                serialization_format="cdr"
+            ))
+            self._bag_writer.create_topic(rosbag2_py.TopicMetadata(
+                id=0,
+                name="/recorded_odometry",
+                type="nav_msgs/msg/Odometry",
+                serialization_format="cdr"
+            ))
+            if self.gps_record_topic:
+                self._bag_writer.create_topic(rosbag2_py.TopicMetadata(
+                    id=0,
+                    name="/recorded_gps",
+                    type="nav_msgs/msg/Odometry",
+                    serialization_format="cdr"
+                ))
+        except Exception as e:
+            elapsed_s = time.perf_counter() - t0
+            self._bag_writer = None
+            self._bag_open = False
+            self._bag_error_banner(
+                "BAG OPEN FAILED — recording cannot save cmd_vel or odometry",
+                f"map={map_name!r}",
+                f"bag_dir={bag_dir}",
+                f"open_time={elapsed_s:.3f}s",
+                f"error={e}",
+            )
+            return False
 
+        elapsed_s = time.perf_counter() - t0
+        self._bag_open_elapsed_s = elapsed_s
+        self.get_logger().warn(
+            f"[record] bag open for cmd_vel/odom writes took {elapsed_s:.3f}s "
+            f"(map={map_name!r} dir={bag_dir})"
+        )
         self._bag_open = True
+        return True
 
     def _bag_close(self):
         # SequentialWriter closes on destruction
@@ -733,16 +1290,18 @@ class MapmakerServer(Node):
         # waypoint. Keeping action and its odometry paired (same output stamp)
         # is what lets the repeater's trajectory mode re-associate poses with
         # distances after reversal.
-        frames = {}  # orig_ns -> {"action": data, "odom": data, "other": [(topic, data)]}
+        frames = {}  # orig_ns -> {"action": data, "odom": data, "gps": data, "other": [(topic, data)]}
         order = []   # orig_ns in first-seen order
         for (t_ns, topic, data) in messages:
             if t_ns not in frames:
-                frames[t_ns] = {"action": None, "odom": None, "other": []}
+                frames[t_ns] = {"action": None, "odom": None, "gps": None, "other": []}
                 order.append(t_ns)
             if topic == "/recorded_actions":
                 frames[t_ns]["action"] = data
             elif topic == "/recorded_odometry":
                 frames[t_ns]["odom"] = data
+            elif topic == "/recorded_gps":
+                frames[t_ns]["gps"] = data
             else:
                 frames[t_ns]["other"].append((topic, data))
 
@@ -818,6 +1377,26 @@ class MapmakerServer(Node):
                         f"Failed to transform /recorded_odometry entry: {e}"
                     )
                 writer.write("/recorded_odometry", data, stamp)
+
+            if frame["gps"] is not None:
+                data = frame["gps"]
+                try:
+                    gps = deserialize_message(data, Odometry)
+                    q = gps.pose.pose.orientation
+                    yaw = math.atan2(
+                        2.0 * (q.w * q.z + q.x * q.y),
+                        1.0 - 2.0 * (q.y * q.y + q.z * q.z),
+                    ) + math.pi
+                    q.x = 0.0
+                    q.y = 0.0
+                    q.z = math.sin(yaw / 2.0)
+                    q.w = math.cos(yaw / 2.0)
+                    data = serialize_message(gps)
+                except Exception as e:
+                    self.get_logger().warn(
+                        f"Failed to transform /recorded_gps entry: {e}"
+                    )
+                writer.write("/recorded_gps", data, stamp)
 
             # Any other topics: pass through unchanged at this stamp.
             for (topic, data) in frame["other"]:
@@ -920,6 +1499,8 @@ class MapmakerServer(Node):
                     f.write(f"stepSize: {self.mapStep}\n")
                     f.write(f"cmdVelTopic: {self.cmd_vel_topic}\n")
                     f.write(f"odomTopic: {self.odom_record_topic}\n")
+                    if self.gps_record_topic:
+                        f.write(f"gpsTopic: {self.gps_record_topic}\n")
                     f.write(f"cameraTopic: {self._active_camera_topic}\n")
             except Exception as e:
                 self.get_logger().warn(f"Unable to create map directory, ignoring: {e}")
@@ -928,7 +1509,10 @@ class MapmakerServer(Node):
                 return result
 
             self.get_logger().info("Starting mapping")
-            self._bag_open_for_map(goal.map_name)
+            if not self._bag_open_for_map(goal.map_name):
+                result.success = False
+                goal_handle.abort()
+                return result
 
             # Persist the start pose immediately so the bag's first
             # /recorded_odometry sample reflects the true beginning of the
@@ -937,16 +1521,11 @@ class MapmakerServer(Node):
             # configured (or no message has arrived yet), skip silently —
             # this must not abort goal acceptance.
             if self.lastOdom is not None:
-                try:
-                    now_ns = self.get_clock().now().nanoseconds
-                    self._bag_writer.write(
-                        "/recorded_odometry",
-                        serialize_message(self.lastOdom),
-                        now_ns,
-                    )
-                except Exception as e:
-                    self.get_logger().warn(
-                        f"Could not record start pose to /recorded_odometry: {e}"
+                now_ns = self.get_clock().now().nanoseconds
+                if not self._bag_write("/recorded_odometry", self.lastOdom, now_ns):
+                    self._bag_error_banner(
+                        "START ODOM WRITE FAILED — bag may lack initial /recorded_odometry",
+                        f"map={goal.map_name!r} odom_topic={self.odom_record_topic}",
                     )
             else:
                 self.get_logger().info(
@@ -954,11 +1533,34 @@ class MapmakerServer(Node):
                     "/recorded_odometry will start at the first motion step"
                 )
 
+            if self.lastGpsOdom is not None:
+                now_ns = self.get_clock().now().nanoseconds
+                if not self._bag_write("/recorded_gps", self.lastGpsOdom, now_ns):
+                    self._bag_error_banner(
+                        "START GPS WRITE FAILED — bag may lack initial /recorded_gps",
+                        f"map={goal.map_name!r} gps_topic={self.gps_record_topic}",
+                    )
+
             self.mapName = goal.map_name
             self.nextStep = 0.0
             self.last_action_dist = 0.0
             self._startup_skip_count = 3
+            self._reset_record_debug_stats()
             self.isMapping = True
+            self._open_repr_trace(goal.map_name)
+            self._log_teach_topic_banner("teach_START")
+            self._start_teach_feed_watchdog()
+            pubs = 0
+            try:
+                pubs = self.joy_sub.get_publisher_count()
+            except Exception:
+                pass
+            self._record_debug_log(
+                f'START map={goal.map_name!r} backward={self._backward_record} '
+                f'cmd_vel={self.joy_topic} pubs={pubs} '
+                f'odom={self.odom_record_topic or "(none)"} '
+                f'action_step={self.action_dist_step:.3f}m kp_step={self.mapStep:.3f}m'
+            )
             result.success = True
             goal_handle.succeed()
             return result
@@ -972,6 +1574,7 @@ class MapmakerServer(Node):
                         float(self.dist), self.curr_hist, self.curr_alignment,
                         self.source_map, self.save_imgs, self.bridge
                     ))
+                    self._note_kp_saved(float(self.dist))
                     self.get_logger().info(f"Creating final wp at dist: {self.dist}")
                 else:
                     self.get_logger().warn(
@@ -980,6 +1583,9 @@ class MapmakerServer(Node):
             self.get_logger().warn(
                 f"STOP STATE | header={self.header is not None} | img={self.img_msg is not None} | feat={self.img_features is not None} | dist={self.dist}"
             )
+            self._dump_record_summary('STOP')
+            self._stop_teach_feed_watchdog()
+            self._close_repr_trace()
             self.get_logger().warn("Stopping Mapping")
             self.get_logger().info(f"Map saved under: '{os.path.abspath(_map_path(self.mapName))}'")
 

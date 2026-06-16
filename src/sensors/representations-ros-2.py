@@ -6,7 +6,6 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
-from rclpy.executors import MultiThreadedExecutor
 
 from sensor_msgs.msg import CompressedImage, Image
 from cv_bridge import CvBridge
@@ -81,27 +80,11 @@ class RepresentationMatching(Node):
         # hits an already-warm model, so the matching pipeline starts
         # flowing immediately once the repeater is active — rather than
         # the robot traversing several metres before alignment kicks in.
-        try:
-            dummy = np.zeros((RESIZE_W, RESIZE_W, 3), dtype=np.uint8)
-            dummy_msg = self.bridge.cv2_to_imgmsg(dummy, encoding="rgb8")
-            warm_in = ImageList()
-            warm_in.data = [dummy_msg]
-            t0 = self.get_clock().now()
-            _ = self.align_abs._to_feature(warm_in)
-            dt = (self.get_clock().now() - t0).nanoseconds / 1e9
-            self.get_logger().warn(f"NN warmed up in {dt:.2f}s")
-        except Exception as e:
-            self.get_logger().warn(
-                f"NN warmup failed (will warm on first frame): {e}"
-            )
 
-        # Two subscriptions, two *separate* mutually-exclusive callback groups.
-        # A single shared group would serialise image_parserCB (slow CNN) with
-        # map_parserCB (tiny assignment), starving map_parserCB whenever the
-        # camera pushes frames faster than the CNN can process them, which
-        # leaves self.sns_in_msg = None forever and silently disables matching.
-        # Each callback still runs non-reentrant with itself, but the two can
-        # now run in parallel on the MultiThreadedExecutor's threads.
+        # Two subscriptions kept on separate mutually-exclusive callback groups.
+        # Under the single-threaded executor every callback is serialised
+        # regardless, but the distinct groups are retained so behaviour is
+        # preserved if a multi-threaded executor is reintroduced.
         self.pub = self.create_publisher(FeaturesList, "live_representation", SYNC_FEEDER_QOS)
         self.pub_match = self.create_publisher(SensorsInput, "matched_repr", NAVIGATION_QOS)
 
@@ -225,10 +208,8 @@ class RepresentationMatching(Node):
 def main():
     rclpy.init()
     node = RepresentationMatching()
-    executor = MultiThreadedExecutor(num_threads=4)
-    executor.add_node(node)
     try:
-        executor.spin()
+        rclpy.spin(node)
     finally:
         node.destroy_node()
         rclpy.shutdown()

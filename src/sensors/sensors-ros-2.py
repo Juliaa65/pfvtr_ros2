@@ -80,7 +80,7 @@ class SensorProcessingNode(Node):
         # particles-topic publish and a couple of chatty per-update logs in
         # PF2D. The publisher itself is always created so that toggling debug
         # is a pure attribute flip without touching ROS handles.
-        self.declare_parameter("debug", False)
+        self.declare_parameter("debug", True)
 
         # Hoisted onto self.* so _build_repeat_fusion can rebuild the fusion
         # at runtime without re-reading parameters or re-loading the Siamese

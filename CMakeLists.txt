@@ -57,6 +57,7 @@ install(PROGRAMS
   src/sensors/sensors-ros-2.py
   src/sensors/representations-ros-2.py
   src/diagnostics/topic_diagnostics.py
+  src/diagnostics/particles_viewer.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

@@ -186,6 +186,8 @@ class RepeaterServer(Node):
         # After goal success, keep publishing distance_remaining=0 so downstream
         # trackers/controllers see a held-at-goal signal until the next repeat.
         self._goal_distance_timer = None
+        self._repeat_dist_seen = False
+        self._warned_repeat_no_distance = False
 
 
         self.get_logger().debug("Waiting for services to become available...")
@@ -253,6 +255,15 @@ class RepeaterServer(Node):
         self._stop_goal_distance_pub()
         self.get_logger().warn("Received stop request!")
         return resp
+
+    def _repeat_error_banner(self, headline: str, *lines: str) -> None:
+        body = "".join(f"\n  {line}" for line in lines)
+        self.get_logger().error(
+            "\n" + "!" * 72 +
+            f"\n  {headline}" +
+            body +
+            "\n" + "!" * 72
+        )
 
     def _publish_distance_remaining(self, value: float) -> None:
         msg = Float32()
@@ -356,6 +367,8 @@ class RepeaterServer(Node):
     def distanceCB(self, msg: SensorsOutput):
         if self.isRepeating is False:
             return
+
+        self._repeat_dist_seen = True
 
         # if self.img is None:
         #     rospy.logwarn("Warning: no image received")
@@ -503,7 +516,12 @@ class RepeaterServer(Node):
             self.action_dists = np.array(self.action_dists)
             self.get_logger().warn(f"Actions and distances successfully loaded! ({len(self.actions)} actions)")
         else:
-            self.get_logger().warn("WARNING: No action commands found in rosbag!")
+            self._repeat_error_banner(
+                "REPEAT BAG HAS NO cmd_vel ACTIONS — /recorded_actions is empty",
+                f"bag={bag_uri}",
+                "Repeat cannot replay map_vel without recorded actions in the bag.",
+                "Re-teach the map or disable null_cmd if all actions were filtered.",
+            )
             self.action_dists = None
 
         # Build distance-sorted odometry arrays for trajectory mode.
@@ -520,7 +538,11 @@ class RepeaterServer(Node):
             self.odom_x = None
             self.odom_y = None
             self.odom_yaw = None
-            self.get_logger().warn("No /recorded_odometry in bag — trajectory mode will publish empty paths.")
+            self._repeat_error_banner(
+                "REPEAT BAG HAS NO ODOMETRY — /recorded_odometry is empty or unpaired",
+                f"bag={bag_uri}",
+                "Trajectory mode will publish empty paths.",
+            )
 
     @staticmethod
     def _yaw_from_quat(q):
@@ -710,8 +732,27 @@ class RepeaterServer(Node):
         # recorded Twist actions and the recorded odometry trajectory.
         self.parse_rosbag(bag_uri)
 
+        if self.use_cmd_vel and self.action_dists is None:
+            self._repeat_error_banner(
+                "REPEAT ABORTED — no recorded actions to replay",
+                f"map={map_name!r} bag={bag_uri}",
+                "Fix the teach bag or disable use_cmd_vel before retrying.",
+            )
+            result.success = False
+            goal_handle.abort()
+            return result
+
+        if self.publish_trajectory and self.odom_dists is None:
+            self._repeat_error_banner(
+                "REPEAT STARTED WITHOUT ODOMETRY TRAJECTORY",
+                f"map={map_name!r} bag={bag_uri}",
+                "publish_trajectory is enabled but the bag has no /recorded_odometry.",
+            )
+
         self.get_logger().info("Repeating started!")
         self._stop_goal_distance_pub()
+        self._repeat_dist_seen = False
+        self._warned_repeat_no_distance = False
         self.isRepeating = True
 
         # Initial actuation kick (distanceCB then keeps it going).
@@ -720,8 +761,18 @@ class RepeaterServer(Node):
         if self.use_cmd_vel:
             self.play_closest_action()
 
+        repeat_ticks = 0
         while self.isRepeating:
             time.sleep(1)
+            repeat_ticks += 1
+            if repeat_ticks == 3 and not self._repeat_dist_seen and not self._warned_repeat_no_distance:
+                self._warned_repeat_no_distance = True
+                self._repeat_error_banner(
+                    "REPEAT RUNNING BUT PF DISTANCE IS MISSING — repeat/output_dist silent",
+                    f"map={map_name!r} start_pos={goal.start_pos}",
+                    "No distance updates received since repeat started.",
+                    "cmd_vel replay and goal finish checks will not work correctly.",
+                )
             self.checkShutdown()
 
         result.success = True
