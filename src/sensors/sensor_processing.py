@@ -6,6 +6,9 @@ import torch as t
 
 import rclpy
 from rclpy.time import Time
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+
+from std_msgs.msg import Float32
 
 from base_classes import DisplacementEstimator, RelativeDistanceEstimator, AbsoluteDistanceEstimator, \
     SensorFusion, ProbabilityDistanceEstimator, RepresentationsCreator
@@ -207,6 +210,22 @@ class PF2D(SensorFusion):
         # when particles cluster just below it.
         self._max_visible_dist = None
 
+        # Within this many meters of the map end the visual distance likelihood
+        # is unreliable (it saturates on the last few images and biases the
+        # estimate forward), so we ignore it and let odometry carry the
+        # distance. Fed by the repeater's repeat/distance_remaining topic.
+        self._dist_feedback_cutoff = 5.0
+        self.distance_remaining = None
+        remaining_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        node.create_subscription(
+            Float32, "repeat/distance_remaining",
+            self._distance_remaining_cb, remaining_qos,
+        )
+
         self._min_align_noise = 0.01
         self._map_trans_time = 5.0
 
@@ -258,6 +277,9 @@ class PF2D(SensorFusion):
             self.particles[2] = 0
             self.particle_prob = np.ones(self.particles_num) / self.particles_num
             self.last_image = None
+            # Drop any stale remaining-distance (the repeater holds it at 0
+            # after a goal) so we use visual feedback again from the start.
+            self.distance_remaining = None
             self._get_coords()
 
             self._log.info(
@@ -484,6 +506,15 @@ class PF2D(SensorFusion):
                     eval_d, map_masked_particles[1], grid=False
                 )
 
+            # Final stretch: the visual distance match saturates on the last
+            # images and biases the estimate forward. Ignore it and let
+            # odometry carry the distance (uniform weights make the resample
+            # distance-agnostic; alignment is still corrected in the motion
+            # step via curr_img_diff).
+            if (self.distance_remaining is not None
+                    and self.distance_remaining < self._dist_feedback_cutoff):
+                particle_prob = np.ones_like(particle_prob)
+
             self.particle_prob = particle_prob
             self.particle_prob[self.particle_prob < 0] = 0.0   # lower than 0.0 probability - should not happen though
 
@@ -517,6 +548,9 @@ class PF2D(SensorFusion):
 
                 # rospy.logwarn(
                 #     "Finished processing - everything took: " + str((rospy.Time.now() - msg.header.stamp).to_sec()) + " secs")
+
+    def _distance_remaining_cb(self, msg: Float32):
+        self.distance_remaining = float(msg.data)
 
     def _process_rel_distance(self, msg):
         # only increment the distance
