@@ -214,7 +214,7 @@ class PF2D(SensorFusion):
         # is unreliable (it saturates on the last few images and biases the
         # estimate forward), so we ignore it and let odometry carry the
         # distance. Fed by the repeater's repeat/distance_remaining topic.
-        self._dist_feedback_cutoff = 5.0
+        self._dist_feedback_cutoff = 5.0 # TODO: do it as a config parameter
         self.distance_remaining = None
         remaining_qos = QoSProfile(
             depth=1,
@@ -550,7 +550,8 @@ class PF2D(SensorFusion):
                 #     "Finished processing - everything took: " + str((rospy.Time.now() - msg.header.stamp).to_sec()) + " secs")
 
     def _distance_remaining_cb(self, msg: Float32):
-        self.distance_remaining = float(msg.data)
+        if float(msg.data) > 0.01:
+            self.distance_remaining = float(msg.data)
 
     def _process_rel_distance(self, msg):
         # only increment the distance
