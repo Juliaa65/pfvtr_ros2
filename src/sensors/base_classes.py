@@ -9,6 +9,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from pfvtr.msg import FloatList
 from pfvtr.msg import SensorsOutput, ImageList, Features
 from pfvtr.srv import SetDist, Representations
+from std_msgs.msg import Header
 
 NAVIGATION_QOS = QoSProfile(
     depth=1,
@@ -273,12 +274,17 @@ class SensorFusion(ABC):
 
 
 
-    def publish_dist(self):
+    def publish_dist(self, reset_stamp=None):
         """
              publish distance as a float in meters - we need always header for time synchronization!
         """
         out = SensorsOutput()
-        if self.header is not None:
+        if reset_stamp is not None:
+            out.header = Header()
+            out.header.stamp = reset_stamp
+            if self.header is not None:
+                out.header.frame_id = self.header.frame_id
+        elif self.header is not None:
             out.header = self.header
         if self.distance is not None:
             out.output = float(self.distance)
@@ -325,7 +331,7 @@ class SensorFusion(ABC):
         self.distance_std = 0.0
         self.map = getattr(request, 'map_num', 0)
         self.distance = request.dist
-        self.publish_dist()
+        self.publish_dist(reset_stamp=self.node.get_clock().now().to_msg())
         return response
 
     def set_alignment(self, request: SetDist.Request, response: SetDist.Response):

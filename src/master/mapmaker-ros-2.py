@@ -205,6 +205,7 @@ class MapmakerServer(Node):
         self.mapStep = 1.0
         self.nextStep = 0.0
         self._startup_skip_count = 0  # flush stale repr frames after START
+        self._teach_bag_armed = False
         self._last_teach_lookup_warn_ns = 0
         self.visual_turn = True
         self.max_trans = 0.3
@@ -269,7 +270,7 @@ class MapmakerServer(Node):
             float(self.get_parameter("record_debug_period_sec").value) * 1e9)
         self._teach_repr_trace = bool(self.get_parameter("teach_repr_trace").value)
         self._teach_repr_log_every = max(
-            1, int(self.get_parameter("teach_repr_log_every").value))
+            100, int(self.get_parameter("teach_repr_log_every").value))
         self._teach_feed_watchdog_sec = float(
             self.get_parameter("teach_feed_watchdog_sec").value)
 
@@ -342,6 +343,7 @@ class MapmakerServer(Node):
 
         self.get_logger().warn("Mapmaker starting subscribers")
         self._setup_teach_sync()
+        self._apply_teach_dist_reset(0.0)
         self._log_teach_topic_banner("init")
 
         self._bag_writer = None
@@ -610,6 +612,19 @@ class MapmakerServer(Node):
         cam_n = len(self._cam_cache.cache_msgs) if self._cam_cache is not None else 0
         return dist_n, cam_n
 
+    def _apply_teach_dist_reset(self, dist: float) -> None:
+        # Local boundary after teach/set_dist: the service resets the fusion
+        # estimator, but mapmaker keeps its own latched state (distance cache,
+        # self.dist, last_action_dist) that must be cleared in the same beat.
+        if self._dist_cache is not None:
+            self._dist_cache.cache_msgs = []
+            self._dist_cache.cache_times = []
+        self.dist = float(dist)
+        self.last_action_dist = float(dist)
+        self.nextStep = float(dist)
+        self._startup_skip_count = 3
+        self._teach_bag_armed = False
+
     def _teach_sync_fail(self, kind: str, detail: str) -> None:
         self._teach_sync_stats[kind] += 1
         self._teach_sync_stats['last_fail'] = f"{kind}: {detail}"
@@ -634,7 +649,8 @@ class MapmakerServer(Node):
 
         if (self._teach_repr_log_every == 1
                 or n <= 10
-                or n % self._teach_repr_log_every == 0):
+                or n % self._teach_repr_log_every == 0
+                or self.isMapping is not False):
             self.get_logger().info(
                 f"[teach_repr] {trace_line} topic={self._fq_topic('live_representation')}"
             )
@@ -796,7 +812,6 @@ class MapmakerServer(Node):
         self.img_msg = img
         self.header = repr_msg.header
         dist = float(dist_msg.output)
-        self.dist = dist
         if not self.isMapping:
             self._teach_sync_stats['skip_not_mapping'] += 1
             return
@@ -806,7 +821,11 @@ class MapmakerServer(Node):
         if self._startup_skip_count > 0:
             self._teach_sync_stats['skip_startup'] += 1
             self._startup_skip_count -= 1
+            if self._startup_skip_count == 0:
+                self._teach_bag_armed = True
             return
+
+        self.dist = dist
 
         # obtain displacement between prev and new image
         if self.visual_turn and self.last_img_features is not None and dist:
@@ -880,6 +899,8 @@ class MapmakerServer(Node):
         self._first_joy_saved = False
         self._first_joy_recv = False
         self._first_repr_recv = False
+        self._first_saved_action_dist = None
+        self._min_kp_dist = float('inf')
         self._warned_no_bag = False
         self._warned_dist_stuck = False
         self._bag_write_failures = 0
@@ -926,6 +947,7 @@ class MapmakerServer(Node):
         self._teach_sync_stats['kp_queued'] += 1
         self._last_kp_dist = float(dist)
         self._max_kp_dist = max(self._max_kp_dist, self._last_kp_dist)
+        self._min_kp_dist = min(self._min_kp_dist, self._last_kp_dist)
 
     def _maybe_log_record_status(self, where: str) -> None:
         if not self._record_debug or not self.isMapping:
@@ -983,6 +1005,17 @@ class MapmakerServer(Node):
             f'last_saved vx={self._last_action_vx:+.3f} wz={self._last_action_wz:+.3f}'
         )
         self._dump_teach_sync_summary(phase)
+        if (
+            self._first_saved_action_dist is not None
+            and self._min_kp_dist < float('inf')
+            and self._first_saved_action_dist - self._min_kp_dist > 0.5
+        ):
+            self._bag_error_banner(
+                "TEACH BAG MISALIGNED — first action far from first waypoint",
+                f"map={self.mapName!r} first_kp={self._min_kp_dist:.3f}m "
+                f"first_action={self._first_saved_action_dist:.3f}m",
+                "Replay will fail unless the map is re-taught from a clean reset.",
+            )
         if act_gap > 0.05:
             self.get_logger().error(
                 f'[record/{phase}] ACTIONS STOPPED {act_gap:.2f}m BEFORE PF DISTANCE '
@@ -1064,6 +1097,8 @@ class MapmakerServer(Node):
 
     def joy_cb(self, msg: TwistStamped):
         if self.isMapping:
+            if not self._teach_bag_armed:
+                return
             self._joy_stats['recv'] += 1
             self._last_joy_vx = float(msg.twist.linear.x)
             self._last_joy_wz = float(msg.twist.angular.z)
@@ -1114,6 +1149,8 @@ class MapmakerServer(Node):
                 self._last_action_vx = float(msg.twist.linear.x)
                 self._last_action_wz = float(msg.twist.angular.z)
                 self._joy_stats['saved'] += 1
+                if self._first_saved_action_dist is None:
+                    self._first_saved_action_dist = float(self.dist)
                 if self._record_debug and not self._first_joy_saved:
                     self._first_joy_saved = True
                     self._record_debug_log(
@@ -1542,10 +1579,8 @@ class MapmakerServer(Node):
                     )
 
             self.mapName = goal.map_name
-            self.nextStep = 0.0
-            self.last_action_dist = 0.0
-            self._startup_skip_count = 3
             self._reset_record_debug_stats()
+            self._apply_teach_dist_reset(0.0)
             self.isMapping = True
             self._open_repr_trace(goal.map_name)
             self._log_teach_topic_banner("teach_START")
