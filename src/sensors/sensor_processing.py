@@ -214,7 +214,7 @@ class PF2D(SensorFusion):
         # is unreliable (it saturates on the last few images and biases the
         # estimate forward), so we ignore it and let odometry carry the
         # distance. Fed by the repeater's repeat/distance_remaining topic.
-        self._dist_feedback_cutoff = 5.0 # TODO: do it as a config parameter
+        self._dist_feedback_cutoff = 3.0 # TODO: do it as a config parameter
         self.distance_remaining = None
         remaining_qos = QoSProfile(
             depth=1,
