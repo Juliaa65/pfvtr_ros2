@@ -210,11 +210,10 @@ class PF2D(SensorFusion):
         # when particles cluster just below it.
         self._max_visible_dist = None
 
-        # Within this many meters of the map end the visual distance likelihood
-        # is unreliable (it saturates on the last few images and biases the
-        # estimate forward), so we ignore it and let odometry carry the
-        # distance. Fed by the repeater's repeat/distance_remaining topic.
-        self._dist_feedback_cutoff = 3.0 # TODO: do it as a config parameter
+        # Meters of slack when comparing the lookaround tail to the map
+        # terminus (matches repeater distance_finish_offset scale).
+        self._map_end_window_tol = 0.05
+        # Fed by the repeater's repeat/distance_remaining topic.
         self.distance_remaining = None
         remaining_qos = QoSProfile(
             depth=1,
@@ -385,6 +384,7 @@ class PF2D(SensorFusion):
             hists = [hists[len_per_map * map_idx:len_per_map * (map_idx + 1)] for map_idx in range(self.map_num)]
             dists = np.array([dists[len_per_map * map_idx:len_per_map * (map_idx + 1)] for map_idx in range(self.map_num)])
             self._max_visible_dist = float(np.max(dists[:, -1]))
+            in_final_window = self._in_final_lookaround_window(dists)
             timestamps = [timestamps[len_per_map * map_idx:len_per_map * (map_idx + 1)] for map_idx in range(self.map_num)]
             time_diffs = [self._get_time_diff(timestamps[map_idx]) for map_idx in range(self.map_num)]
             if self.map_num > 1:
@@ -467,7 +467,7 @@ class PF2D(SensorFusion):
                     # rospy.logwarn("Motion step finished!")
 
             # add randomly spawned particles
-            if self.add_rand > 0:
+            if self.add_rand > 0 and not in_final_window:
                 new = []
                 tmp = np.zeros((3, int(self.particles_num * self.add_rand)))
                 tmp[0, :] = self.rng.uniform(low=np.mean(dists[:, 0]), high=np.mean(dists[:, -1]),
@@ -483,49 +483,51 @@ class PF2D(SensorFusion):
                         [self.particle_prob, np.zeros((self.particles[0].size - self.particles_num), )]
                     )
 
-            # sensor step
-            particle_prob = np.zeros(self.particles.shape[-1])
             self.particles[1] = np.clip(self.particles[1], -1.0, 1.0)  # more than 0% overlap is nonsense
-            for map_idx in range(self.map_num):
-                map_particle_mask = self.particles[2] == map_idx
-                map_masked_particles = self.particles[:, map_particle_mask]
 
-                interp_f = interpolate.RectBivariateSpline(
-                    dists[map_idx], np.linspace(-1.0, 1.0, hist_width), hists[map_idx], kx=1
-                )
-                # Evaluate likelihood at the nearest in-map distance. Particles
-                # pushed past the last image by odometry would otherwise get
-                # extrapolated (often negative) weight and be killed on resample,
-                # capping the published distance below the visible tail.
-                eval_d = np.clip(
-                    map_masked_particles[0],
-                    dists[map_idx][0],
-                    dists[map_idx][-1],
-                )
-                particle_prob[map_particle_mask] = interp_f(
-                    eval_d, map_masked_particles[1], grid=False
-                )
+            if in_final_window:
+                # Map terminus is in the lookaround window: visual distance
+                # likelihood saturates and resampling would cap the estimate at
+                # the window tail. Let odometry carry distance; alignment is
+                # still corrected in the motion step via curr_img_diff.
+                if self.debug:
+                    self._log.info(
+                        "Final lookaround window: skipping visual weighting and resample"
+                    )
+            else:
+                # sensor step
+                particle_prob = np.zeros(self.particles.shape[-1])
+                for map_idx in range(self.map_num):
+                    map_particle_mask = self.particles[2] == map_idx
+                    map_masked_particles = self.particles[:, map_particle_mask]
 
-            # Final stretch: the visual distance match saturates on the last
-            # images and biases the estimate forward. Ignore it and let
-            # odometry carry the distance (uniform weights make the resample
-            # distance-agnostic; alignment is still corrected in the motion
-            # step via curr_img_diff).
-            if (self.distance_remaining is not None
-                    and self.distance_remaining < self._dist_feedback_cutoff):
-                particle_prob = np.ones_like(particle_prob)
+                    interp_f = interpolate.RectBivariateSpline(
+                        dists[map_idx], np.linspace(-1.0, 1.0, hist_width), hists[map_idx], kx=1
+                    )
+                    # Evaluate likelihood at the nearest in-map distance. Particles
+                    # pushed past the last image by odometry would otherwise get
+                    # extrapolated (often negative) weight and be killed on resample,
+                    # capping the published distance below the visible tail.
+                    eval_d = np.clip(
+                        map_masked_particles[0],
+                        dists[map_idx][0],
+                        dists[map_idx][-1],
+                    )
+                    particle_prob[map_particle_mask] = interp_f(
+                        eval_d, map_masked_particles[1], grid=False
+                    )
 
-            self.particle_prob = particle_prob
-            self.particle_prob[self.particle_prob < 0] = 0.0   # lower than 0.0 probability - should not happen though
+                self.particle_prob = particle_prob
+                self.particle_prob[self.particle_prob < 0] = 0.0   # lower than 0.0 probability - should not happen though
 
-            # perform some normalization and resample the particles via roulette wheel
-            # particle_prob -= particle_prob.min()
-            # particle_prob /= particle_prob.sum()
-            softmaxed_probs = self._numpy_softmax(self.particle_prob, self.BETA_choice)
-            chosen_indices = self.rng.choice(np.shape(self.particles)[1], int(self.particles_num), p=softmaxed_probs)
-            # self._log.warn((self.particles[2, chosen_indices])
-            self.particle_prob = self.particle_prob[chosen_indices]
-            self.particles = self.particles[:, chosen_indices]
+                # perform some normalization and resample the particles via roulette wheel
+                # particle_prob -= particle_prob.min()
+                # particle_prob /= particle_prob.sum()
+                softmaxed_probs = self._numpy_softmax(self.particle_prob, self.BETA_choice)
+                chosen_indices = self.rng.choice(np.shape(self.particles)[1], int(self.particles_num), p=softmaxed_probs)
+                # self._log.warn((self.particles[2, chosen_indices])
+                self.particle_prob = self.particle_prob[chosen_indices]
+                self.particles = self.particles[:, chosen_indices]
 
             # publish filtering output ------------------------------------------------------------------
             self.last_image = msg.live_features
@@ -552,6 +554,35 @@ class PF2D(SensorFusion):
     def _distance_remaining_cb(self, msg: Float32):
         if float(msg.data) > 0.01:
             self.distance_remaining = float(msg.data)
+
+    def _in_final_lookaround_window(self, dists: np.ndarray) -> bool:
+        """True when the map end is visible in the lookaround window and the
+        route remainder fits inside that window (from distance_remaining).
+
+        In that regime visual distance weighting and resampling are skipped so
+        odometry can advance the particle cloud to the true map terminus.
+        """
+        if (self.distance_remaining is None
+                or self._max_visible_dist is None
+                or self.particles is None):
+            return False
+        if self.distance_remaining <= 0.01:
+            return False
+
+        window_lo = float(np.min(dists[:, 0]))
+        window_span = self._max_visible_dist - window_lo
+        if window_span <= 0.0:
+            return False
+
+        map_end = float(np.mean(self.particles[0])) + self.distance_remaining
+        if dists.shape[1] > 1:
+            last_gap = float(np.min(dists[:, -1] - dists[:, -2]))
+            tol = max(self._map_end_window_tol, 0.5 * last_gap)
+        else:
+            tol = self._map_end_window_tol
+        map_end_in_window = self._max_visible_dist >= map_end - tol
+        near_map_end = self.distance_remaining <= window_span
+        return map_end_in_window and near_map_end
 
     def _process_rel_distance(self, msg):
         # only increment the distance
