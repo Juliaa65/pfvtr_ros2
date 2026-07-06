@@ -216,6 +216,34 @@ class RepeaterServer(Node):
         self.joy_topic = "map_vel"
         self.joy_pub = self.create_publisher(TwistStamped, self.joy_topic, NAVIGATION_QOS)
 
+        # map_representations is ~118 KB per message (lookaround Siamese
+        # features); serializing it inline in distanceCB used to delay action
+        # replay. It now runs on its own timer + callback group and only
+        # publishes when the lookaround window actually changed (with a
+        # periodic refresh, since the topic is BEST_EFFORT depth 1).
+        self._SNS_REFRESH_SEC = 0.5
+        self._last_sns_pub_time = None
+        self._last_sns_pub_img = None
+        self._sns_pub_timer = self.create_timer(
+            0.05, self.pubSensorsInput,
+            callback_group=get_exclusive_callback_group()
+        )
+
+        # cmd_vel keepalive: distanceCB-driven replay stops the instant the PF
+        # output hiccups, which starves the downstream twist mux into its
+        # zero-velocity fallback (observed as stop-and-go motion). A 50 Hz
+        # timer re-publishes the last selected action while it is fresh; if
+        # the PF stays silent longer than the staleness limit the keepalive
+        # stops and the mux fallback halts the robot (safety preserved).
+        self._KEEPALIVE_MAX_STALENESS = 1.0
+        self._last_action_twist = None
+        self._last_action_time = None   # last distanceCB-driven action selection
+        self._last_vel_pub_time = None  # last actual publish on map_vel
+        self._vel_keepalive_timer = self.create_timer(
+            0.02, self._vel_keepalive_tick,
+            callback_group=get_exclusive_callback_group()
+        )
+
         # Live distance from the PF estimate to the end of the active map.
         # The controller subscribes to this and uses it to ramp linear.x +
         # angular.z toward zero as the robot approaches the goal.
@@ -331,6 +359,19 @@ class RepeaterServer(Node):
                 transitions.extend(self.map_transitions[map_idx][lower_bound:upper_bound - 1])
                 map_indices.extend([map_idx for i in range(upper_bound - lower_bound)])
 
+            # Content only changes when the lookaround window moves. Skip the
+            # ~118 KB serialization when nothing changed; refresh periodically
+            # anyway because the topic is BEST_EFFORT depth 1.
+            now = time.monotonic()
+            refresh_due = (
+                self._last_sns_pub_time is None
+                or now - self._last_sns_pub_time >= self._SNS_REFRESH_SEC
+            )
+            if self.nearest_map_img == self._last_sns_pub_img and not refresh_due:
+                return
+            self._last_sns_pub_time = now
+            self._last_sns_pub_img = self.nearest_map_img
+
             if self.nearest_map_img != last_nearest_img:
                 self.get_logger().info(
                     "matching image " + str(self.map_distances[-1][self.nearest_map_img]) +
@@ -397,12 +438,12 @@ class RepeaterServer(Node):
             self.shutdown()
 
         # Actuation: trajectory and cmd_vel replay are independent.
+        # (map_representations publishing moved to its own timer so the heavy
+        # serialization never delays the actuation path.)
         if self.publish_trajectory:
             self._publish_trajectory()
         if self.use_cmd_vel:
             self.play_closest_action()
-
-        self.pubSensorsInput()
 
 
     def goalValid(self, goal) -> bool:
@@ -453,6 +494,9 @@ class RepeaterServer(Node):
 
     def shutdown(self):
         self.isRepeating = False
+        # Stop the cmd_vel keepalive immediately (isRepeating gate would catch
+        # it too; clearing the cached action removes any race).
+        self._last_action_twist = None
         # Goal-distance timer is started by distanceCB on success; keep it
         # running so repeat/distance_remaining stays at 0 after the action ends.
 
@@ -559,6 +603,7 @@ class RepeaterServer(Node):
         out.header.stamp = self.get_clock().now().to_msg()
         out.header.frame_id = "base_link"
         out.twist = twist
+        self._last_vel_pub_time = time.monotonic()
         self.joy_pub.publish(out)
 
     def play_closest_action(self):
@@ -566,7 +611,11 @@ class RepeaterServer(Node):
             distance_to_pos = abs(self.curr_dist - self.action_dists)
             closest_idx = int(np.argmin(distance_to_pos))
             if closest_idx != self.last_closest_action_idx:
-                self.get_logger().info("Replaying action " + str(closest_idx) + " at distance " + str(self.action_dists[closest_idx]) + " from current position " + str(self.curr_dist))
+                # debug level: fires on every action-index change (up to the
+                # teach recording rate) and info-level spam is measurable.
+                self.get_logger().debug("Replaying action " + str(closest_idx) + " at distance " + str(self.action_dists[closest_idx]) + " from current position " + str(self.curr_dist))
+            self._last_action_twist = self.actions[closest_idx]
+            self._last_action_time = time.monotonic()
             self._publish_vel(self.actions[closest_idx])
             self.last_closest_action_idx = closest_idx
         else:
@@ -574,8 +623,28 @@ class RepeaterServer(Node):
             req = SetDist.Request()
             req.dist = 0.0
             req.map_num = 1
-            self.align_reset_cli.call(req)
+            # async: a synchronous call here can wedge the executor thread
+            # servicing this callback (and with it the whole actuation path).
+            self.align_reset_cli.call_async(req)
+            self._last_action_twist = None
             self._publish_vel(Twist())
+
+    def _vel_keepalive_tick(self):
+        # Re-publish the last replayed action at 50 Hz while it is fresh so a
+        # momentary PF/output_dist hiccup cannot starve the downstream twist
+        # mux into its zero-velocity fallback. Stops once the PF output has
+        # been silent for _KEEPALIVE_MAX_STALENESS (robot then halts safely).
+        if not self.isRepeating or not self.use_cmd_vel:
+            return
+        if self._last_action_twist is None or self._last_action_time is None:
+            return
+        now = time.monotonic()
+        if now - self._last_action_time > self._KEEPALIVE_MAX_STALENESS:
+            return
+        # distanceCB already published very recently; avoid doubling the rate.
+        if self._last_vel_pub_time is not None and now - self._last_vel_pub_time < 0.018:
+            return
+        self._publish_vel(self._last_action_twist)
 
 
     def _publish_trajectory(self):
@@ -702,6 +771,15 @@ class RepeaterServer(Node):
         self.last_closest_idx = 0
         self.map_alignments = []
         self.map_times = []
+
+        # Reset replay/keepalive/publisher caches from any previous goal.
+        self.last_closest_action_idx = -1
+        self._last_action_twist = None
+        self._last_action_time = None
+        self._last_vel_pub_time = None
+        self._last_sns_pub_time = None
+        self._last_sns_pub_img = None
+        self.nearest_map_img = -1
 
         map_loader = threading.Thread(
             target=load_map,

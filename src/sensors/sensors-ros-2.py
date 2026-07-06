@@ -21,6 +21,14 @@ SYNC_FEEDER_QOS = QoSProfile(
     durability=DurabilityPolicy.VOLATILE
 )
 
+# Odometry is a state stream: only the latest message matters. depth=1 so a
+# slow fusion update never causes a catch-up burst of stale odom callbacks.
+ODOM_QOS = QoSProfile(
+    depth=1,
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    durability=DurabilityPolicy.VOLATILE
+)
+
 def get_exclusive_callback_group():
     return MutuallyExclusiveCallbackGroup()
 
@@ -236,7 +244,12 @@ class SensorProcessingNode(Node):
                          abs_align_topic, abs_dist_topic, rel_dist_topic, prob_dist_topic,
                          rel_align_service_name):
 
-        cb_group = get_exclusive_callback_group()
+        # Each subscription gets its own exclusive callback group so a slow
+        # abs-alignment update (the heavy PF step) can run concurrently with
+        # the 50 Hz odometry callback under the MultiThreadedExecutor. Shared
+        # fusion state is protected by the fusion's own _particle_lock; a
+        # single shared group used to serialize everything and stalled
+        # output_dist during pf2d repeats.
         subs = []
         srvs = []
 
@@ -246,7 +259,7 @@ class SensorProcessingNode(Node):
                 abs_align_topic,
                 fusion.process_abs_alignment,
                 SYNC_FEEDER_QOS,
-                callback_group=cb_group
+                callback_group=get_exclusive_callback_group()
             ))
 
         if fusion.abs_dist_est is not None and len(abs_dist_topic) > 0:
@@ -254,8 +267,8 @@ class SensorProcessingNode(Node):
                 fusion.abs_dist_est.supported_message_type,
                 abs_dist_topic,
                 fusion.process_abs_distance,
-                SYNC_FEEDER_QOS,
-                callback_group=cb_group
+                ODOM_QOS,
+                callback_group=get_exclusive_callback_group()
             ))
 
         if fusion.rel_dist_est is not None and len(rel_dist_topic) > 0:
@@ -263,8 +276,8 @@ class SensorProcessingNode(Node):
                 fusion.rel_dist_est.supported_message_type,
                 rel_dist_topic,
                 fusion.process_rel_distance,
-                SYNC_FEEDER_QOS,
-                callback_group=cb_group
+                ODOM_QOS,
+                callback_group=get_exclusive_callback_group()
             ))
 
         if fusion.prob_dist_est is not None and len(prob_dist_topic) > 0:
@@ -273,7 +286,7 @@ class SensorProcessingNode(Node):
                 prob_dist_topic,
                 fusion.process_prob_distance,
                 SYNC_FEEDER_QOS,
-                callback_group=cb_group
+                callback_group=get_exclusive_callback_group()
             ))
 
         if fusion.rel_align_est is not None and len(rel_align_service_name) > 0:

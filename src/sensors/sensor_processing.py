@@ -316,84 +316,89 @@ class PF2D(SensorFusion):
         return out
 
     def _process_abs_alignment(self, msg):
+        # Message parsing and histogram sampling run OUTSIDE the particle
+        # lock: they only read the message (plus constant hyperparameters),
+        # and holding the lock here used to block the 50 Hz odometry callback
+        # for the entire update, stalling output_dist.
+        curr_time = _builtin_stamp_to_rclpy_time(msg.header.stamp, self._clock)
+        self.header = msg.header
+        # Authoritative map count lives on the live stream; SetDist can't
+        # carry it without colliding with the base class's index semantics.
+        self.map_num = max(1, int(msg.map_num))
+        if self.last_time is None:
+            self.last_time = curr_time
+            return
+
+        dists = np.array(msg.map_distances)
+        len_per_map = np.size(dists) // self.map_num
+
+        if len_per_map == 1:
+            self._log.error("!!!Only one image matched - fallback to bearnav classic!!!")
+            self.fallback_bearnav = True
+            # self.distance = self.init_distance
+
+        if self.fallback_bearnav:
+            histogram = np.array(msg.map_histograms[0].values).reshape(msg.map_histograms[0].shape)
+            self.alignment = (np.argmax(histogram) - np.size(histogram) // 2) / (np.size(histogram) // 2)
+            if self.debug:
+                self._log.info("Fallback displacement: " + str(self.alignment))
+            return
+
+        hists = np.array(msg.map_histograms[0].values).reshape(msg.map_histograms[0].shape)
+        self.last_hists = hists
+        map_trans = np.array(msg.map_transitions[0].values).reshape(msg.map_transitions[0].shape)
+        live_hist = np.array(msg.live_histograms[0].values).reshape(msg.live_histograms[0].shape)
+        hist_width = hists.shape[-1]
+        shifts = np.round(np.array(msg.map_offset) * (hist_width // 2)).astype(int)
+        hists = np.roll(hists, shifts, -1) # not sure if last dim should be rolled like this
+        curr_img_diff = self._sample_hist([live_hist])
+        curr_time_diff = _duration_to_sec(curr_time - self.last_time)
+        timestamps = msg.map_timestamps
+
+        # Divide incoming data according the map affiliation
+        trans_per_map = len_per_map - 1
+        # Defensive: at end-of-repeat the repeater can publish a SensorsInput
+        # whose map_transitions row count doesn't match (len_per_map - 1) *
+        # map_num. Without this guard the mismatch surfaces as an IndexError
+        # on the `trans[closest_transition.squeeze(), ...]` access below,
+        # crashing the sensors node and dropping all PF state. Skip the
+        # update gracefully — the next message arrives within ~50 ms and
+        # the filter tolerates dropped updates the same way it tolerates
+        # the `abs(traveled) < 0.001` short-circuit further down.
+        expected_trans_rows = trans_per_map * self.map_num
+        if map_trans.shape[0] != expected_trans_rows:
+            self._log.warn(
+                f"PF2D abs_alignment skipped: map_trans has "
+                f"{map_trans.shape[0]} rows but expected {expected_trans_rows} "
+                f"(len_per_map={len_per_map}, map_num={self.map_num}). "
+                "Most likely end-of-repeat publisher race; ignoring this update."
+            )
+            self.last_time = curr_time
+            return
+        if len(dists) % msg.map_num > 0:
+            # TODO: this assumes that there is same number of features comming from all the maps (this does not have to hold when 2*map_len < lookaround)
+            # however the mapmaker was updated so that the new maps should have always the same number of images, unless some major error occurs
+            self._log.warn("!!!!!!!!!!!!!!!!!! One map has more images than other !!!!!!!!!!!!!!!!")
+            return
+
+        map_trans = [map_trans[trans_per_map * map_idx:trans_per_map * (map_idx + 1)] for map_idx in range(self.map_num)]
+        hists = [hists[len_per_map * map_idx:len_per_map * (map_idx + 1)] for map_idx in range(self.map_num)]
+        dists = np.array([dists[len_per_map * map_idx:len_per_map * (map_idx + 1)] for map_idx in range(self.map_num)])
+        self._max_visible_dist = float(np.max(dists[:, -1]))
+        timestamps = [timestamps[len_per_map * map_idx:len_per_map * (map_idx + 1)] for map_idx in range(self.map_num)]
+        time_diffs = [self._get_time_diff(timestamps[map_idx]) for map_idx in range(self.map_num)]
+        if self.map_num > 1:
+            # transition matrix for between maps
+            map_matrix = msg.map_transitions
+
+        # if len(hists) < 2 or len(trans) != len(hists) - 1 or len(dists) != len(hists) or len(trans) == 0:
+        #     rospy.logwarn("Invalid input sizes for particle filter!")
+        #     return
+
+        debug_snapshot = None
         with self._particle_lock:
-            # Parse all data from the incoming message
-            curr_time = _builtin_stamp_to_rclpy_time(msg.header.stamp, self._clock)
-            self.header = msg.header
-            # Authoritative map count lives on the live stream; SetDist can't
-            # carry it without colliding with the base class's index semantics.
-            self.map_num = max(1, int(msg.map_num))
-            if self.last_time is None:
-                self.last_time = curr_time
-                return
-
-            dists = np.array(msg.map_distances)
-            len_per_map = np.size(dists) // self.map_num
-
-            if len_per_map == 1:
-                self._log.error("!!!Only one image matched - fallback to bearnav classic!!!")
-                self.fallback_bearnav = True
-                # self.distance = self.init_distance
-
-            if self.fallback_bearnav:
-                histogram = np.array(msg.map_histograms[0].values).reshape(msg.map_histograms[0].shape)
-                self.alignment = (np.argmax(histogram) - np.size(histogram) // 2) / (np.size(histogram) // 2)
-                if self.debug:
-                    self._log.info("Fallback displacement: " + str(self.alignment))
-                return
-
-            hists = np.array(msg.map_histograms[0].values).reshape(msg.map_histograms[0].shape)
-            self.last_hists = hists
-            map_trans = np.array(msg.map_transitions[0].values).reshape(msg.map_transitions[0].shape)
-            live_hist = np.array(msg.live_histograms[0].values).reshape(msg.live_histograms[0].shape)
-            hist_width = hists.shape[-1]
-            shifts = np.round(np.array(msg.map_offset) * (hist_width // 2)).astype(int)
-            hists = np.roll(hists, shifts, -1) # not sure if last dim should be rolled like this
-            curr_img_diff = self._sample_hist([live_hist])
-            curr_time_diff = _duration_to_sec(curr_time - self.last_time)
-            timestamps = msg.map_timestamps
             traveled = self.traveled_dist
-
-            # Divide incoming data according the map affiliation
-            trans_per_map = len_per_map - 1
-            # Defensive: at end-of-repeat the repeater can publish a SensorsInput
-            # whose map_transitions row count doesn't match (len_per_map - 1) *
-            # map_num. Without this guard the mismatch surfaces as an IndexError
-            # on the `trans[closest_transition.squeeze(), ...]` access below,
-            # crashing the sensors node and dropping all PF state. Skip the
-            # update gracefully — the next message arrives within ~50 ms and
-            # the filter tolerates dropped updates the same way it tolerates
-            # the `abs(traveled) < 0.001` short-circuit further down.
-            expected_trans_rows = trans_per_map * self.map_num
-            if map_trans.shape[0] != expected_trans_rows:
-                self._log.warn(
-                    f"PF2D abs_alignment skipped: map_trans has "
-                    f"{map_trans.shape[0]} rows but expected {expected_trans_rows} "
-                    f"(len_per_map={len_per_map}, map_num={self.map_num}). "
-                    "Most likely end-of-repeat publisher race; ignoring this update."
-                )
-                self.last_time = curr_time
-                return
-            if len(dists) % msg.map_num > 0:
-                # TODO: this assumes that there is same number of features comming from all the maps (this does not have to hold when 2*map_len < lookaround)
-                # however the mapmaker was updated so that the new maps should have always the same number of images, unless some major error occurs
-                self._log.warn("!!!!!!!!!!!!!!!!!! One map has more images than other !!!!!!!!!!!!!!!!")
-                return
-
-            map_trans = [map_trans[trans_per_map * map_idx:trans_per_map * (map_idx + 1)] for map_idx in range(self.map_num)]
-            hists = [hists[len_per_map * map_idx:len_per_map * (map_idx + 1)] for map_idx in range(self.map_num)]
-            dists = np.array([dists[len_per_map * map_idx:len_per_map * (map_idx + 1)] for map_idx in range(self.map_num)])
-            self._max_visible_dist = float(np.max(dists[:, -1]))
             in_final_window = self._in_final_lookaround_window(dists)
-            timestamps = [timestamps[len_per_map * map_idx:len_per_map * (map_idx + 1)] for map_idx in range(self.map_num)]
-            time_diffs = [self._get_time_diff(timestamps[map_idx]) for map_idx in range(self.map_num)]
-            if self.map_num > 1:
-                # transition matrix for between maps
-                map_matrix = msg.map_transitions
-
-            # if len(hists) < 2 or len(trans) != len(hists) - 1 or len(dists) != len(hists) or len(trans) == 0:
-            #     rospy.logwarn("Invalid input sizes for particle filter!")
-            #     return
 
             if abs(traveled) < 0.001:
                 # this is when odometry is slower than the estimator
@@ -535,21 +540,20 @@ class PF2D(SensorFusion):
             self.traveled_dist = 0.0
             self._get_coords()  # this updates the values which are published continuously
 
-            #  self._log.warn(np.array((dist_diff, hist_diff)))
-            # visualization & debugging
             if self.debug:
-                #for
-                particles_out = self.particles.flatten()
-                particles_out = np.concatenate([particles_out, self.coords.flatten()])
-                m = FloatList()
-                m.data = list(particles_out)
-                self.particles_pub.publish(m)
-                self._log.info("Outputted position: " + str(np.mean(self.particles[0, :])) + " +- " + str(np.std(self.particles[0, :])))
-                self._log.info("Outputted alignment: " + str(np.mean(self.particles[1, :])) + " +- " + str(np.std(self.particles[1, :])) + " with transitions: " + str(np.mean(curr_img_diff)))
-                #               + " and " + str(np.mean(trans_diff)))
+                # Snapshot under the lock; serialize/publish/log after release
+                # so the odometry callback is not blocked by debug I/O.
+                debug_snapshot = (np.copy(self.particles), np.copy(self.coords))
 
-                # rospy.logwarn(
-                #     "Finished processing - everything took: " + str((rospy.Time.now() - msg.header.stamp).to_sec()) + " secs")
+        # visualization & debugging (outside the particle lock)
+        if debug_snapshot is not None:
+            particles_snap, coords_snap = debug_snapshot
+            particles_out = np.concatenate([particles_snap.flatten(), coords_snap.flatten()])
+            m = FloatList()
+            m.data = list(particles_out)
+            self.particles_pub.publish(m)
+            self._log.info("Outputted position: " + str(np.mean(particles_snap[0, :])) + " +- " + str(np.std(particles_snap[0, :])))
+            self._log.info("Outputted alignment: " + str(np.mean(particles_snap[1, :])) + " +- " + str(np.std(particles_snap[1, :])) + " with transitions: " + str(np.mean(curr_img_diff)))
 
     def _distance_remaining_cb(self, msg: Float32):
         if float(msg.data) > 0.01:
@@ -593,8 +597,17 @@ class PF2D(SensorFusion):
                     self.distance += dist
                 else:
                     self.particles[0] += dist
-                    self._get_coords()
                     self.traveled_dist += dist
+                    # Odometry shifts every particle by the same amount, so the
+                    # published estimate is shifted directly instead of being
+                    # re-estimated. The full KDE estimate (_get_coords) runs
+                    # only in _process_abs_alignment: at ~20 ms per call it
+                    # cannot run at 50 Hz odometry rate — doing so saturated
+                    # the sensors node and stalled output_dist (stop-and-go
+                    # motion during pf2d cmd_vel repeats).
+                    if self.coords is not None:
+                        self.coords[0] += dist
+                        self.distance = float(self.coords[0])
 
     def _process_abs_distance(self, msg):
         self._log.warn("This function is not available for this fusion class")
