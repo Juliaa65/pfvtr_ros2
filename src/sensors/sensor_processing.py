@@ -258,33 +258,50 @@ class PF2D(SensorFusion):
         self.particles_pub = node.create_publisher(FloatList, "particles", 1)
 
 
+    def _reseed_particles(self, dst: float) -> None:
+        """Discard the current cloud and spawn a fresh one at ``dst``.
+
+        Caller must hold ``self._particle_lock``. Resets all PF state that can
+        mutate particle distances after spawn (notably relative odometry).
+        """
+        self.fallback_bearnav = False
+        self.init_distance = dst
+
+        var = (self.odom_init_std, self.align_init_std, 0)
+        self.particles = np.transpose(
+            np.ones((3, self.particles_num)).transpose() * np.array((dst, 0, 0))
+            + self.rng.normal(loc=(0, 0, 0), scale=var, size=(self.particles_num, 3)))
+        # Repeats always begin on map index 0; the true map count is learned
+        # from SensorsInput.map_num in _process_abs_alignment (SetDist.map_num
+        # carries the starting *index* for base-class compatibility).
+        self.particles[2] = 0
+        self.particle_prob = np.ones(self.particles_num) / self.particles_num
+
+        if self.rel_dist_est is not None and hasattr(self.rel_dist_est, "reset"):
+            self.rel_dist_est.reset()
+
+        self.last_image = None
+        self.last_time = None
+        self.traveled_dist = 0.0
+        self.distance_remaining = None
+        self._max_visible_dist = None
+        self._get_coords()
+
+        self._log.info(
+            "Particles reseeded at position " + str(self.distance) + "m"
+            + " with alignment " + str(self.alignment)
+        )
+        if self.debug:
+            d = self.particles[0]
+            self._log.info(
+                f"Reseed particle distances: min={float(d.min()):.3f} "
+                f"max={float(d.max()):.3f} mean={float(d.mean()):.3f}"
+            )
+
     def set_distance(self, request: SetDist.Request, response: SetDist.Response):
         with self._particle_lock:
-            self.fallback_bearnav = False
             response = super(PF2D, self).set_distance(request, response)
-
-            var = (self.odom_init_std, self.align_init_std, 0)
-            dst = self.distance
-            self.init_distance = self.distance
-            self.particles = np.transpose(
-                np.ones((3, self.particles_num)).transpose() * np.array((dst, 0, 0))
-                + self.rng.normal(loc=(0, 0, 0), scale=var, size=(self.particles_num, 3)))
-            # self.particles = self.particles - np.mean(self.particles, axis=-1, keepdims=True)
-            # Repeats always begin on map index 0; the true map count is learned
-            # from SensorsInput.map_num in _process_abs_alignment (SetDist.map_num
-            # carries the starting *index* for base-class compatibility).
-            self.particles[2] = 0
-            self.particle_prob = np.ones(self.particles_num) / self.particles_num
-            self.last_image = None
-            # Drop any stale remaining-distance (the repeater holds it at 0
-            # after a goal) so we use visual feedback again from the start.
-            self.distance_remaining = None
-            self._get_coords()
-
-            self._log.info(
-                "Particles reinitialized at position " + str(self.distance) + "m"
-                + " with alignment " + str(self.alignment)
-            )
+            self._reseed_particles(self.distance)
             return response
 
     def _process_rel_alignment(self, request: Alignment.Request):

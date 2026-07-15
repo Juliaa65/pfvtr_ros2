@@ -88,5 +88,9 @@ class OdometryRelative(RelativeDistanceEstimator):
 
         return ret  # + abs(dturn)
 
+    def reset(self) -> None:
+        """Drop the last pose so the next odom message is a baseline only."""
+        self.last_odom = None
+
     def health_check(self) -> bool:
         return True

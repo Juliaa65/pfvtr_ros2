@@ -293,6 +293,18 @@ class RepeaterServer(Node):
             "\n" + "!" * 72
         )
 
+    def _call_repeat_set_dist(self, dist: float, map_num: int = 0) -> bool:
+        req = SetDist.Request()
+        req.dist = float(dist)
+        req.map_num = int(map_num)
+        resp = self.distance_reset_cli.call(req)
+        if resp is None:
+            self.get_logger().error(
+                f"repeat/set_dist failed (dist={dist}, map_num={map_num})"
+            )
+            return False
+        return True
+
     def _publish_distance_remaining(self, value: float) -> None:
         msg = Float32()
         msg.data = float(value)
@@ -729,6 +741,18 @@ class RepeaterServer(Node):
             goal_handle.succeed()
             return result
 
+        # Discard the previous-run particle cloud immediately so odometry
+        # cannot advance stale particles during map load.
+        if not self._call_repeat_set_dist(float(goal.start_pos), map_num=0):
+            self._repeat_error_banner(
+                "REPEAT ABORTED — repeat/set_dist failed on goal accept",
+                f"map={goal.map_name.split(',')[0]!r} start_pos={goal.start_pos}",
+            )
+            result.success = False
+            goal_handle.abort()
+            return result
+        self.curr_dist = float(goal.start_pos)
+
         map_name = goal.map_name.split(",")[0]
         self.parseParams(_map_path(map_name, "params"))
 
@@ -797,15 +821,6 @@ class RepeaterServer(Node):
 
         bag_uri = _map_path(map_name, "bag")
 
-
-        req = SetDist.Request()
-        req.dist = float(goal.start_pos)
-        req.map_num = 0
-        self.distance_reset_cli.call(req)
-
-        self.curr_dist = float(goal.start_pos)
-        time.sleep(2)
-
         # Distance-based replay is the only mode. parse_rosbag loads both the
         # recorded Twist actions and the recorded odometry trajectory.
         self.parse_rosbag(bag_uri)
@@ -826,6 +841,18 @@ class RepeaterServer(Node):
                 f"map={map_name!r} bag={bag_uri}",
                 "publish_trajectory is enabled but the bag has no /recorded_odometry.",
             )
+
+        # Reseed again after map/bag load so PF2D and relative odom are clean
+        # immediately before actuation begins.
+        if not self._call_repeat_set_dist(float(goal.start_pos), map_num=0):
+            self._repeat_error_banner(
+                "REPEAT ABORTED — repeat/set_dist failed before start",
+                f"map={map_name!r} start_pos={goal.start_pos}",
+            )
+            result.success = False
+            goal_handle.abort()
+            return result
+        self.curr_dist = float(goal.start_pos)
 
         self.get_logger().info("Repeating started!")
         self._stop_goal_distance_pub()
