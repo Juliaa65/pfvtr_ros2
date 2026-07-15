@@ -323,6 +323,11 @@ class MapmakerServer(Node):
 
         self.get_logger().debug("Subscribing to commands")
         self.joy_sub = self.create_subscription(TwistStamped, self.joy_topic, self.joy_cb, NAVIGATION_QOS)
+        # Latch teach distance at output_dist rate (~odom), not representation rate.
+        # joy_cb bag writes must follow this latch; keyframes stay sync-gated.
+        self._teach_dist_sub = self.create_subscription(
+            SensorsOutput, "teach/output_dist", self._teach_dist_cb, SYNC_QOS
+        )
 
         if self.odom_record_topic:
             self.add_sub = self.create_subscription(Odometry, self.odom_record_topic, self.misc_cb, NAVIGATION_QOS)
@@ -612,6 +617,9 @@ class MapmakerServer(Node):
         cam_n = len(self._cam_cache.cache_msgs) if self._cam_cache is not None else 0
         return dist_n, cam_n
 
+    def _teach_dist_cb(self, msg: SensorsOutput) -> None:
+        self.dist = float(msg.output)
+
     def _apply_teach_dist_reset(self, dist: float) -> None:
         # Local boundary after teach/set_dist: the service resets the fusion
         # estimator, but mapmaker keeps its own latched state (distance cache,
@@ -824,8 +832,6 @@ class MapmakerServer(Node):
             if self._startup_skip_count == 0:
                 self._teach_bag_armed = True
             return
-
-        self.dist = dist
 
         # obtain displacement between prev and new image
         if self.visual_turn and self.last_img_features is not None and dist:

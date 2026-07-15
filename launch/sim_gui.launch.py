@@ -63,7 +63,7 @@ def generate_launch_description():
     choice_beta = DeclareLaunchArgument("choice_beta", default_value="2.5")
     position_estimator = DeclareLaunchArgument(
         "position_estimator",
-        default_value="kde",
+        default_value="weighted_mean",
         description=(
             "PF2D output estimator. 'kde' picks the dominant mode (default, "
             "correct under multimodal posteriors). 'weighted_mean' is the legacy "
