@@ -279,10 +279,19 @@ class RepeaterServer(Node):
         return resp
 
     def stopService(self, req, resp):
-        self.isRepeating = False
-        self._stop_goal_distance_pub()
         self.get_logger().warn("Received stop request!")
+        # Gate pubSensorsInput / actuation before clearing the lookaround latch.
+        self.isRepeating = False
+        self._invalidate_map_lookaround()
+        self._last_action_twist = None
+        self._stop_goal_distance_pub()
         return resp
+
+    def _invalidate_map_lookaround(self) -> None:
+        """Publish empty map_nxt so representations clears its latched SensorsInput."""
+        sns_in = SensorsInput()
+        sns_in.header.stamp = self.get_clock().now().to_msg()
+        self.sensors_pub.publish(sns_in)
 
     def _repeat_error_banner(self, headline: str, *lines: str) -> None:
         body = "".join(f"\n  {line}" for line in lines)
@@ -447,6 +456,7 @@ class RepeaterServer(Node):
             self.isRepeating = False
             self.action_dists = []
             self.actions = []
+            # shutdown() also clears the representations lookaround latch.
             self.shutdown()
 
         # Actuation: trajectory and cmd_vel replay are independent.
@@ -505,10 +515,14 @@ class RepeaterServer(Node):
             self._active_goal_handle = None
 
     def shutdown(self):
+        # Shared stop path: goal reached, action cancel, and (via isRepeating)
+        # any other finish. Publish empty map_nxt so representations drops the
+        # latched lookaround (same clear as stopService).
         self.isRepeating = False
         # Stop the cmd_vel keepalive immediately (isRepeating gate would catch
         # it too; clearing the cached action removes any race).
         self._last_action_twist = None
+        self._invalidate_map_lookaround()
         # Goal-distance timer is started by distanceCB on success; keep it
         # running so repeat/distance_remaining stays at 0 after the action ends.
 

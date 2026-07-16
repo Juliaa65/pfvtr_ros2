@@ -202,6 +202,10 @@ class RepresentationMatching(Node):
         self.last_live = live_feature[0]
 
     def map_parserCB(self, sns_in: SensorsInput):
+        # Empty map_nxt = clear sentinel from repeater on stop.
+        if not sns_in.map_features:
+            self.sns_in_msg = None
+            return
         self.sns_in_msg = sns_in
 
 
