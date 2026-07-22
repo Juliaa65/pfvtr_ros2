@@ -68,6 +68,8 @@ class SensorProcessingNode(Node):
         self.declare_parameter("kde_grid_res", 64)
         self.declare_parameter("kde_align_span", 0.5)
         self.declare_parameter("kde_min_align_frac", 0.08)
+        self.declare_parameter("kde_max_step_back", 0.1)
+        self.declare_parameter("kde_max_step_fwd", 0.1)
         self.declare_parameter("matching_type", "siam")
         self.declare_parameter("model_path", "")
         # Repeat-phase fusion class. Two options:
@@ -110,6 +112,8 @@ class SensorProcessingNode(Node):
         self.kde_grid_res = int(self.get_parameter("kde_grid_res").value)
         self.kde_align_span = float(self.get_parameter("kde_align_span").value)
         self.kde_min_align_frac = float(self.get_parameter("kde_min_align_frac").value)
+        self.kde_max_step_back = float(self.get_parameter("kde_max_step_back").value)
+        self.kde_max_step_fwd = float(self.get_parameter("kde_max_step_fwd").value)
         matching_type = self.get_parameter("matching_type").value
         model_path = self.get_parameter("model_path").value
         if len(model_path) == 0:
@@ -199,6 +203,8 @@ class SensorProcessingNode(Node):
                 kde_grid_res=self.kde_grid_res,
                 kde_align_span=self.kde_align_span,
                 kde_min_align_frac=self.kde_min_align_frac,
+                kde_max_step_back=self.kde_max_step_back,
+                kde_max_step_fwd=self.kde_max_step_fwd,
                 abs_align_est=self.align_abs,
                 rel_align_est=self.align_rel,
                 rel_dist_est=self.dist_rel,

@@ -34,7 +34,7 @@ class Controller:
         # factor so the robot smoothly stops in place (no rotation at zero
         # forward speed).
         if self.decelDistance > 0.0:
-            decel_scale = max(0.1, min(1.0, self.distanceRemaining / self.decelDistance))
+            decel_scale = max(0.25, min(1.0, self.distanceRemaining / self.decelDistance))
         else:
             decel_scale = 1.0
         out = Twist()

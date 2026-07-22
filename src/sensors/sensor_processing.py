@@ -166,6 +166,8 @@ class PF2D(SensorFusion):
         kde_grid_res: int = 64,
         kde_align_span: float = 0.5,
         kde_min_align_frac: float = 0.08,
+        kde_max_step_back: float = 0.1,
+        kde_max_step_fwd: float = 0.1,
     ):
         super().__init__(
             node,
@@ -246,6 +248,11 @@ class PF2D(SensorFusion):
         # auto-scales with particles_num. Resolved to an absolute count at use
         # time via self._kde_min_align_count().
         self._kde_min_align_frac = float(kde_min_align_frac)
+        # Asymmetric max Δdistance (m) per visual KDE update vs previous
+        # published distance. Suppresses mode hops. Each side <=0 disables
+        # that direction. Odometry increments are not clamped.
+        self._kde_max_step_back = float(kde_max_step_back)
+        self._kde_max_step_fwd = float(kde_max_step_fwd)
 
         self.BETA_align = align_beta
         self.BETA_choice = choice_beta
@@ -488,14 +495,23 @@ class PF2D(SensorFusion):
                     self.particles[2, random_indices] = random_particles
                     # rospy.logwarn("Motion step finished!")
 
-            # add randomly spawned particles
+            # Random respawn uses the same end-of-map gate as visual feedback.
+            # Spawn uniformly in ±N around the current distance estimate, where
+            # N is the lookaround window span — not only inside [window_lo,
+            # window_hi], which capped the estimate below map_end.
             if self.add_rand > 0 and not in_final_window:
+                n_rand = int(self.particles_num * self.add_rand)
+                est_d = float(np.mean(self.particles[0]))
+                window_span = float(np.mean(dists[:, -1]) - np.mean(dists[:, 0]))
+                n_span = max(window_span, 0.0)
                 new = []
-                tmp = np.zeros((3, int(self.particles_num * self.add_rand)))
-                tmp[0, :] = self.rng.uniform(low=np.mean(dists[:, 0]), high=np.mean(dists[:, -1]),
-                                             size=(1, int(self.particles_num * self.add_rand)))
-                tmp[1, :] = self.rng.uniform(low=-0.5, high=0.5, size=(1, int(self.particles_num * self.add_rand)))
-                tmp[2, :] = np.random.randint(low=0, high=self.map_num, size=(1, int(self.particles_num * self.add_rand)))
+                tmp = np.zeros((3, n_rand))
+                tmp[0, :] = self.rng.uniform(
+                    low=est_d - n_span, high=est_d + n_span, size=(1, n_rand)
+                )
+                tmp[0, :] = np.maximum(tmp[0, :], 0.0)
+                tmp[1, :] = self.rng.uniform(low=-0.5, high=0.5, size=(1, n_rand))
+                tmp[2, :] = np.random.randint(low=0, high=self.map_num, size=(1, n_rand))
                 new.append(tmp.transpose())
                 new.append(self.particles.transpose())
                 self.particles = np.concatenate(new).transpose()
@@ -510,11 +526,13 @@ class PF2D(SensorFusion):
             if in_final_window:
                 # Map terminus is in the lookaround window: visual distance
                 # likelihood saturates and resampling would cap the estimate at
-                # the window tail. Let odometry carry distance; alignment is
-                # still corrected in the motion step via curr_img_diff.
+                # the window tail. Same gate disables add_random above. Let
+                # odometry carry distance; alignment is still corrected in the
+                # motion step via curr_img_diff.
                 if self.debug:
                     self._log.info(
-                        "Final lookaround window: skipping visual weighting and resample"
+                        "Final lookaround window: skipping visual weighting, "
+                        "resample, and random particle respawn"
                     )
             else:
                 # sensor step
@@ -573,28 +591,38 @@ class PF2D(SensorFusion):
             self._log.info("Outputted alignment: " + str(np.mean(particles_snap[1, :])) + " +- " + str(np.std(particles_snap[1, :])) + " with transitions: " + str(np.mean(curr_img_diff)))
 
     def _distance_remaining_cb(self, msg: Float32):
-        if float(msg.data) > 0.01:
-            self.distance_remaining = float(msg.data)
+        # Always store, including ~0 at goal: the final-window gate must see
+        # the terminus, and add_random must stay off after finish.
+        self.distance_remaining = float(msg.data)
 
     def _in_final_lookaround_window(self, dists: np.ndarray) -> bool:
-        """True when the map end is visible in the lookaround window and the
-        route remainder fits inside that window (from distance_remaining).
+        """True near / at the map terminus.
 
-        In that regime visual distance weighting and resampling are skipped so
-        odometry can advance the particle cloud to the true map terminus.
+        Used to skip visual distance weighting, resampling, *and* random
+        particle respawn so odometry can carry the cloud to map_end (otherwise
+        add_random keeps injecting particles into the lookaround window and
+        the repeater never reaches the finish offset).
+
+        Triggers when the lookaround already covers the map end, or when the
+        remaining route fits inside the lookaround span. Covering the end alone
+        is enough: requiring both failed when a lagging estimate made
+        distance_remaining look large even though the window already included
+        the terminus.
         """
         if (self.distance_remaining is None
                 or self._max_visible_dist is None
                 or self.particles is None):
             return False
+        # At / past finish: keep end-of-map behaviour active.
         if self.distance_remaining <= 0.01:
-            return False
+            return True
 
         window_lo = float(np.min(dists[:, 0]))
         window_span = self._max_visible_dist - window_lo
         if window_span <= 0.0:
             return False
 
+        # mean + remaining ≈ true map length (remaining is map_end - estimate).
         map_end = float(np.mean(self.particles[0])) + self.distance_remaining
         if dists.shape[1] > 1:
             last_gap = float(np.min(dists[:, -1] - dists[:, -2]))
@@ -603,12 +631,12 @@ class PF2D(SensorFusion):
             tol = self._map_end_window_tol
         map_end_in_window = self._max_visible_dist >= map_end - tol
         near_map_end = self.distance_remaining <= window_span
-        return map_end_in_window and near_map_end
+        return map_end_in_window or near_map_end
 
     def _process_rel_distance(self, msg):
         # only increment the distance
         dist = self.rel_dist_est.rel_dist_message_callback(msg)
-        if dist is not None and dist >= 0.005:
+        if dist is not None and dist >= 0.001:
             with self._particle_lock:
                 if self.fallback_bearnav:
                     self.distance += dist
@@ -766,6 +794,21 @@ class PF2D(SensorFusion):
                 a_peak = float(grid_a[np.argmax(a_kde(grid_a))])
             except (np.linalg.LinAlgError, ValueError):
                 a_peak = float(grid_a[j])
+        if self.distance is not None and (
+            self._kde_max_step_back > 0.0 or self._kde_max_step_fwd > 0.0
+        ):
+            prev = float(self.distance)
+            lo = (
+                prev - self._kde_max_step_back
+                if self._kde_max_step_back > 0.0
+                else -np.inf
+            )
+            hi = (
+                prev + self._kde_max_step_fwd
+                if self._kde_max_step_fwd > 0.0
+                else np.inf
+            )
+            d_peak = float(np.clip(d_peak, lo, hi))
         return np.array((d_peak, a_peak))
 
 

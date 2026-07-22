@@ -73,6 +73,22 @@ def generate_launch_description():
     kde_grid_res = DeclareLaunchArgument("kde_grid_res", default_value="64")
     kde_align_span = DeclareLaunchArgument("kde_align_span", default_value="0.5")
     kde_min_align_frac = DeclareLaunchArgument("kde_min_align_frac", default_value="0.08")
+    kde_max_step_back = DeclareLaunchArgument(
+        "kde_max_step_back",
+        default_value="0.1",
+        description=(
+            "Max backward Δdistance (m) per visual KDE update. "
+            "<=0 disables. Odometry uncapped."
+        ),
+    )
+    kde_max_step_fwd = DeclareLaunchArgument(
+        "kde_max_step_fwd",
+        default_value="0.1",
+        description=(
+            "Max forward Δdistance (m) per visual KDE update. "
+            "<=0 disables. Odometry uncapped."
+        ),
+    )
     matching_type = DeclareLaunchArgument("matching_type", default_value="siam")
     turn_gain = DeclareLaunchArgument("turn_gain", default_value="1.0")
     velocity_gain = DeclareLaunchArgument("velocity_gain", default_value="1.0")
@@ -124,6 +140,8 @@ def generate_launch_description():
                     "kde_grid_res": lc("kde_grid_res"),
                     "kde_align_span": lc("kde_align_span"),
                     "kde_min_align_frac": lc("kde_min_align_frac"),
+                    "kde_max_step_back": lc("kde_max_step_back"),
+                    "kde_max_step_fwd": lc("kde_max_step_fwd"),
                     "matching_type": lc("matching_type"),
                     "model_path": lc("model_path"),
                     "navigation_method": lc("navigation_method"),
@@ -219,6 +237,8 @@ def generate_launch_description():
         kde_grid_res,
         kde_align_span,
         kde_min_align_frac,
+        kde_max_step_back,
+        kde_max_step_fwd,
         matching_type,
         turn_gain,
         velocity_gain,
