@@ -68,7 +68,11 @@ def generate_launch_description():
         ),
     )
     kde_grid_res = DeclareLaunchArgument("kde_grid_res", default_value="64")
-    kde_align_span = DeclareLaunchArgument("kde_align_span", default_value="0.5")
+    kde_align_span = DeclareLaunchArgument(
+        "kde_align_span",
+        default_value="1.0",
+        description="±m around published d for alignment KDE; <=0 disables (all particles).",
+    )
     kde_min_align_frac = DeclareLaunchArgument("kde_min_align_frac", default_value="0.08")
     kde_max_step_back = DeclareLaunchArgument("kde_max_step_back", default_value="0.1")
     kde_max_step_fwd = DeclareLaunchArgument("kde_max_step_fwd", default_value="0.1")

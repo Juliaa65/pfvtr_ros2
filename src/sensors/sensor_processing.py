@@ -164,7 +164,7 @@ class PF2D(SensorFusion):
         repr_creator: RepresentationsCreator,
         position_estimator: str = "kde",
         kde_grid_res: int = 64,
-        kde_align_span: float = 0.5,
+        kde_align_span: float = 1.0,
         kde_min_align_frac: float = 0.08,
         kde_max_step_back: float = 0.1,
         kde_max_step_fwd: float = 0.1,
@@ -247,6 +247,7 @@ class PF2D(SensorFusion):
         # for the 1D alignment KDE to run. Stored as a fraction so the threshold
         # auto-scales with particles_num. Resolved to an absolute count at use
         # time via self._kde_min_align_count().
+        # kde_align_span <= 0 disables the distance window (use all particles).
         self._kde_min_align_frac = float(kde_min_align_frac)
         # Asymmetric max Δdistance (m) per visual KDE update vs previous
         # published distance. Suppresses mode hops. Each side <=0 disables
@@ -738,9 +739,14 @@ class PF2D(SensorFusion):
         # which are mutated as a pair by _process_abs_alignment / set_distance.
         # Legacy centroid estimator: lands between modes when the posterior is
         # multimodal. Kept as a rollback option behind position_estimator="weighted_mean".
+        # Alignment uses particles within ±kde_align_span of the distance
+        # estimate; span <= 0 disables the window (all particles).
         align_span = self._kde_align_span
         dist = np.sum(particles[0] * particle_prob) / np.sum(particle_prob)
-        mask = (particles[0] < (dist + align_span)) & (particles[0] > (dist - align_span))
+        if align_span <= 0.0:
+            mask = np.ones(particles.shape[1], dtype=bool)
+        else:
+            mask = (particles[0] < (dist + align_span)) & (particles[0] > (dist - align_span))
         if mask.sum() < self._kde_min_align_count():
             self._log.warn(
                 "Only " + str(int(mask.sum()))
@@ -757,8 +763,10 @@ class PF2D(SensorFusion):
     def _get_kde_peak_pos(self, particles, particle_prob):
         # Caller must hold self._particle_lock — reads (particles, particle_prob)
         # which are mutated as a pair by _process_abs_alignment / set_distance.
-        # Two-stage estimator: 2D weighted KDE to find the dominant distance mode,
-        # then a 1D KDE in alignment restricted to particles near that distance.
+        # Distance: 2D weighted KDE peak, then optional max-step clamp vs the
+        # previously published distance (each side <=0 disables that clamp).
+        # Alignment: 1D KDE over particles within ±kde_align_span of that
+        # clamped distance; span <=0 disables the window (all particles).
         if (particle_prob.sum() <= 0
                 or np.isnan(particle_prob).any()
                 or np.isnan(particles).any()):
@@ -784,16 +792,6 @@ class PF2D(SensorFusion):
         density = kde(np.vstack([DD.ravel(), AA.ravel()])).reshape(DD.shape)
         i, j = np.unravel_index(np.argmax(density), density.shape)
         d_peak = float(grid_d[i])
-        mask = (particles[0] > d_peak - self._kde_align_span) & (particles[0] < d_peak + self._kde_align_span)
-        if mask.sum() < self._kde_min_align_count() or particle_prob[mask].sum() <= 0:
-            a_peak = float(grid_a[j])
-        else:
-            w_a = particle_prob[mask] / particle_prob[mask].sum()
-            try:
-                a_kde = gaussian_kde(particles[1, mask], weights=w_a)
-                a_peak = float(grid_a[np.argmax(a_kde(grid_a))])
-            except (np.linalg.LinAlgError, ValueError):
-                a_peak = float(grid_a[j])
         if self.distance is not None and (
             self._kde_max_step_back > 0.0 or self._kde_max_step_fwd > 0.0
         ):
@@ -809,6 +807,25 @@ class PF2D(SensorFusion):
                 else np.inf
             )
             d_peak = float(np.clip(d_peak, lo, hi))
+
+        # Alignment from particles near the distance we will publish.
+        # span <= 0 disables the window (1D KDE / mean over all particles).
+        span = self._kde_align_span
+        if span <= 0.0:
+            mask = np.ones(particles.shape[1], dtype=bool)
+        else:
+            mask = (particles[0] > d_peak - span) & (particles[0] < d_peak + span)
+        if mask.sum() < self._kde_min_align_count() or particle_prob[mask].sum() <= 0:
+            # Too few near the clamped distance: keep previous alignment rather
+            # than the global 2D mode's alignment (often from a distant peak).
+            a_peak = float(self.alignment)
+        else:
+            w_a = particle_prob[mask] / particle_prob[mask].sum()
+            try:
+                a_kde = gaussian_kde(particles[1, mask], weights=w_a)
+                a_peak = float(grid_a[np.argmax(a_kde(grid_a))])
+            except (np.linalg.LinAlgError, ValueError):
+                a_peak = float(np.sum(particles[1, mask] * w_a))
         return np.array((d_peak, a_peak))
 
 

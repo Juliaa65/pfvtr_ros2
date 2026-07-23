@@ -71,7 +71,14 @@ def generate_launch_description():
         ),
     )
     kde_grid_res = DeclareLaunchArgument("kde_grid_res", default_value="64")
-    kde_align_span = DeclareLaunchArgument("kde_align_span", default_value="0.5")
+    kde_align_span = DeclareLaunchArgument(
+        "kde_align_span",
+        default_value="1.0",
+        description=(
+            "±distance (m) around the published distance estimate for the "
+            "alignment KDE / weighted-mean. <=0 disables (use all particles)."
+        ),
+    )
     kde_min_align_frac = DeclareLaunchArgument("kde_min_align_frac", default_value="0.08")
     kde_max_step_back = DeclareLaunchArgument(
         "kde_max_step_back",

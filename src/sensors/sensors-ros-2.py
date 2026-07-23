@@ -66,8 +66,10 @@ class SensorProcessingNode(Node):
         # position_estimator=="kde", but declared unconditionally so launch
         # files don't need to know which estimator is active).
         self.declare_parameter("kde_grid_res", 64)
-        self.declare_parameter("kde_align_span", 0.5)
+        # ±m around published distance for alignment; <=0 = all particles.
+        self.declare_parameter("kde_align_span", 1.0)
         self.declare_parameter("kde_min_align_frac", 0.08)
+        # Max |Δd| per visual KDE update; <=0 disables that side.
         self.declare_parameter("kde_max_step_back", 0.1)
         self.declare_parameter("kde_max_step_fwd", 0.1)
         self.declare_parameter("matching_type", "siam")
