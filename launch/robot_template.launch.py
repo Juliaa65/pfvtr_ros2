@@ -51,7 +51,7 @@ def generate_launch_description():
     dist_init_std = DeclareLaunchArgument("dist_init_std", default_value="1.0")
     align_beta = DeclareLaunchArgument("align_beta", default_value="10.0")
     align_init_std = DeclareLaunchArgument("align_init_std", default_value="1.0")
-    add_random = DeclareLaunchArgument("add_random", default_value="0.01")
+    add_random = DeclareLaunchArgument("add_random", default_value="0.05")
     model_path = DeclareLaunchArgument("model_path", default_value="")
 
     choice_beta = DeclareLaunchArgument("choice_beta", default_value="2.5")

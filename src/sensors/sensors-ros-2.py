@@ -57,7 +57,7 @@ class SensorProcessingNode(Node):
         self.declare_parameter("align_beta", 10.0)
         self.declare_parameter("align_init_std", 1.0)
         self.declare_parameter("choice_beta", 2.5)
-        self.declare_parameter("add_random", 0.01)
+        self.declare_parameter("add_random", 0.05)
         # PF2D output estimator. "kde" picks the dominant mode (correct under
         # multimodal posteriors). "weighted_mean" is the legacy centroid (drifts
         # between modes but well-tested in production).
